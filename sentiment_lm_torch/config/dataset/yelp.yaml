@@ -1,0 +1,2 @@
+training_path: "data/training.npz"
+context_size: 128

@@ -1,0 +1,10 @@
+_target_: sentiment_lm_torch.model.transformer.TransformerModel
+
+num_layers: 12
+num_heads: 12
+d_model: 768
+ffn_size: 2024
+glu: true
+
+activation: 
+  _target_: torch.nn.SiLU
