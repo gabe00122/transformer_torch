@@ -37,13 +37,14 @@ def train(cfg: DictConfig) -> None:
     context_size = cfg.dataset.context_size
     vocab_size = cfg.vocab.size + SPECIAL_TOKENS
     total_steps = len(training_dataloader) * cfg.epochs
+    total_gradient_steps = total_steps // cfg.accumulation_steps
     total_tokens = len(training_dataloader) * batch_size * context_size
 
     model: nn.Module = instantiate(cfg.model, vocab_size=vocab_size, context_size=context_size)
     model.apply(init_weights)
 
     optimizer = instantiate(cfg.optimizer,model.parameters(), fused=True)
-    scheduler = get_cosine_schedule_with_warmup(optimizer, cfg.scheduler.warmup_steps, total_steps)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, cfg.scheduler.warmup_steps, total_gradient_steps)
 
     console.print(f"Token count: {abbreviate_number(total_tokens)}")
     console.print(f"Parameter count: {abbreviate_number(get_param_count(model))}")
