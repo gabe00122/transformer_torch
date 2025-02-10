@@ -51,12 +51,12 @@ def train(cfg: DictConfig) -> None:
     model = model.to(device)    
     train_step_compiled = torch.compile(train_step, fullgraph=True)
 
-    run = wandb.init(project="sentiment_lm_torch")
+    wandb.init(project="sentiment_lm_torch")
 
     loss_metric = 0
 
     model.train()
-    for step, tokens in track(enumerate(ncycles(training_dataloader, cfg.epochs)), total=total_steps):
+    for step, tokens in track(enumerate(ncycles(training_dataloader, cfg.epochs)), total=total_steps, console=console):
         tokens = tokens.to(device)
         
         loss = train_step_compiled(model, tokens, cfg.accumulation_steps)
