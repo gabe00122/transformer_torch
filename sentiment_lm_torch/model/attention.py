@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,6 +22,14 @@ def _einsum_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tenso
     attn_weights = F.softmax(attn_weights, -1)
 
     return torch.einsum("...hqk,...khd->...qhd", attn_weights, value)
+
+@lru_cache
+def causal_block_mask(seq_len: int):
+    def causal(b, h, q_idx, kv_idx):
+        return q_idx >= kv_idx
+
+    block_mask = create_block_mask(causal, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len)
+    return block_mask
 
 
 class AttentionBlock(nn.Module):
@@ -73,10 +83,15 @@ class AttentionBlock(nn.Module):
         key = self.rope(key, segment_positions)
 
         if self.use_flex_attention:
-            def causal_mask(score, b, h, q_idx, kv_idx):
-                return torch.where(q_idx >= kv_idx, score, -float("inf"))
+            # def causal_mask(score, b, h, q_idx, kv_idx):
+            #     return torch.where(q_idx >= kv_idx, score, -float("inf"))
+            block_mask = causal_block_mask(query.shape[-3]) # query.shape[-3]
             
-            x = flex_attention(query, key, value, score_mod=causal_mask)
+            query = einops.rearrange(query, "... l h q -> ... h l q")
+            key = einops.rearrange(key, "... l h q -> ... h l q")
+            value = einops.rearrange(value, "... l h q -> ... h l q")
+            x = flex_attention(query, key, value, block_mask=block_mask)
+            x = einops.rearrange(x, "... h l q -> ... l h q")
         else:
             query = query / self._sqrt_depth
             x = _einsum_attention(query, key, value, mask)

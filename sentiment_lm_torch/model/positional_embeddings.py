@@ -13,10 +13,12 @@ class Rope(nn.Module):
         self.register_buffer("timescale", timescale)
 
     def forward(self, inputs: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        # <could be cached>
         sinusoid_inp = positions[..., None] / self.timescale[None, None, :].to(inputs.dtype)
         sinusoid_inp = sinusoid_inp[..., None, :]
         sin = torch.sin(sinusoid_inp)
         cos = torch.cos(sinusoid_inp)
+        # </could be cached>
 
         first_half, second_half = torch.chunk(inputs, 2, -1)
         first_part = first_half * cos - second_half * sin
