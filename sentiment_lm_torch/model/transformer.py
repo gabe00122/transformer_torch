@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+from torch import Tensor
+from torch.nn.attention.flex_attention import BlockMask
 
 from sentiment_lm_torch.model.attention import AttentionBlock
 from sentiment_lm_torch.model.embeddings import Embedder
@@ -33,9 +35,9 @@ class TransformerLayer(nn.Module):
         ff_block = GLUBlock if glu else FFBlock
         self.ffn = ff_block(d_model, ffn_size, activation=activation)
 
-    def forward(self, x: torch.Tensor, segment_positions: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Tensor, rope_cache: tuple[Tensor, Tensor], block_mask: BlockMask) -> Tensor:
         attention_input = self.attention_norm(x)
-        attention = self.attention(attention_input, segment_positions, mask=mask)
+        attention = self.attention(attention_input, rope_cache, block_mask)
         x = x + attention
 
         feed_forward_input = self.ffn_norm(x)
@@ -91,14 +93,11 @@ class TransformerModel(nn.Module):
 
         self.output_norm = nn.RMSNorm(d_model, dtype=dtype)
 
-        segment_positions = torch.arange(context_size, dtype=torch.int16)
-        self.register_buffer("segment_positions", segment_positions)
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: Tensor, rope_cache: tuple[Tensor, Tensor], block_mask: BlockMask) -> Tensor:
         x = self.embedder(inputs, decode=False)
 
         for layer in self.layers:
-            x = layer(x, self.segment_positions, self.attention_mask)
+            x = layer(x, rope_cache, block_mask)
 
         x = self.output_norm(x)
         x = self.embedder(x, decode=True)

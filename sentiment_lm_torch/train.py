@@ -4,8 +4,11 @@ from omegaconf import DictConfig
 
 import torch
 import torch.nn.functional as F
-from torch import nn
+from torch import Tensor, nn
+from torch.nn.attention.flex_attention import BlockMask
 from torch.utils.data import DataLoader
+
+
 from rich.progress import track
 from rich.console import Console
 from more_itertools import ncycles
@@ -13,6 +16,8 @@ import wandb
 
 from sentiment_lm_torch.constants import SPECIAL_TOKENS
 from sentiment_lm_torch.dataset import SentimentDataset
+from sentiment_lm_torch.model.attention import causal_block_mask
+from sentiment_lm_torch.model.positional_embeddings import create_rope_cache
 from sentiment_lm_torch.model.util import init_weights
 from sentiment_lm_torch.scheduler import get_cosine_schedule_with_warmup
 from sentiment_lm_torch.utils import get_param_count, abbreviate_number
@@ -50,17 +55,22 @@ def train(cfg: DictConfig) -> None:
     console.print(f"Parameter count: {abbreviate_number(get_param_count(model))}")
 
     model = model.to(device)    
-    train_step_compiled = torch.compile(train_step, fullgraph=True)
+    train_step_compiled = train_step #torch.compile(train_step, fullgraph=True)
+    if True:
+        train_step_compiled = torch.compile(train_step, fullgraph=True)
 
-    wandb.init(project="sentiment_lm_torch")
+    # wandb.init(project="sentiment_lm_torch")
 
     loss_metric = 0
+
+    rope_cache = create_rope_cache(cfg.model.d_model // cfg.model.num_heads, torch.arange(context_size))
+    block_mask = causal_block_mask(context_size)
 
     model.train()
     for step, tokens in track(enumerate(ncycles(training_dataloader, cfg.epochs)), total=total_steps, console=console):
         tokens = tokens.to(device)
         
-        loss = train_step_compiled(model, tokens, cfg.accumulation_steps)
+        loss = train_step_compiled(model, tokens, cfg.accumulation_steps, rope_cache, block_mask)
         loss.backward()
 
         loss_metric += loss.item()
@@ -71,10 +81,10 @@ def train(cfg: DictConfig) -> None:
             scheduler.step()
 
             console.print(f"Step {step}, Loss: {loss_metric}")
-            wandb.log({"loss": loss_metric}, step=step)
+            # wandb.log({"loss": loss_metric}, step=step)
             loss_metric = 0
 
-    torch.save(model.state_dict(), "checkpoints/model.pth")
+    # torch.save(model.state_dict(), "checkpoints/model.pth")
 
 
 def loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -84,12 +94,12 @@ def loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(logits, targets, ignore_index=EMPTY_TOKEN)
 
 
-def train_step(model, tokens, accumulation_steps):
+def train_step(model, tokens, accumulation_steps,  rope_cache: tuple[Tensor, Tensor], block_mask: BlockMask):
     input_tokens = tokens[:, :-1]
     labels = tokens[:, 1:]
 
     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-        logits = model(input_tokens)
+        logits = model(input_tokens, rope_cache, block_mask)
         return loss_fn(logits, labels) / accumulation_steps
 
 
