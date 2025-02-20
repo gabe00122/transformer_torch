@@ -5,22 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask, BlockMask
 
+from einops import rearrange
 
-import einops
-import math
+from sentiment_lm_torch.model.positional_embeddings import apply_rope
 
-from sentiment_lm_torch.model.positional_embeddings import Rope
-
-
-def _einsum_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor):
-    attn_weights = torch.einsum("...qhd,...khd->...hqk", query, key)
-
-    big_neg = torch.finfo(attn_weights.dtype).min
-    attn_weights = torch.where(mask, attn_weights, big_neg)
-
-    attn_weights = F.softmax(attn_weights, -1)
-
-    return torch.einsum("...hqk,...khd->...qhd", attn_weights, value)
 
 @lru_cache
 def causal_block_mask(seq_len: int):
@@ -29,10 +17,6 @@ def causal_block_mask(seq_len: int):
 
     block_mask = create_block_mask(causal, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len)
     return block_mask
-
-
-def flip_head_length(x: torch.Tensor):
-    return einops.rearrange(x, "... heads length depth -> ... length heads depth")
 
 
 class AttentionBlock(nn.Module):
@@ -65,8 +49,6 @@ class AttentionBlock(nn.Module):
             dtype=self.dtype,
         )
 
-        self.rope = Rope()
-
         self.out_proj = nn.Linear(
             self.num_heads * self.head_dim,
             self.d_model,
@@ -76,19 +58,15 @@ class AttentionBlock(nn.Module):
 
     def forward(self, inputs: torch.Tensor, rope_cache: tuple[torch.Tensor, torch.Tensor], block_mask: BlockMask) -> torch.Tensor:
         in_proj = self.in_proj(inputs)
-        in_proj = einops.rearrange(in_proj, "... (heads qkv) -> ... heads qkv", heads=self.num_heads)
+        in_proj = rearrange(in_proj, "... seq (heads qkv) -> ... heads seq qkv", heads=self.num_heads)
         query, key, value = torch.chunk(in_proj, 3, -1)
 
-        query = self.rope(query, rope_cache)
-        key = self.rope(key, rope_cache)
+        query = apply_rope(query, rope_cache)
+        key = apply_rope(key, rope_cache)
 
-        query = flip_head_length(query)
-        key = flip_head_length(key)
-        value = flip_head_length(value)
         x = flex_attention(query, key, value, block_mask=block_mask)
-        x = flip_head_length(x)
         
-        x = einops.rearrange(x, "... heads qkv -> ... (heads qkv)")
+        x = rearrange(x, "... heads seq qkv -> ... seq (heads qkv)")
         x = self.out_proj(x)
 
         return x

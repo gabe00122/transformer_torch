@@ -8,7 +8,7 @@ defaults:
 
 epochs: 3
 batch_size: 1536
-accumulation_steps: 48
+accumulation_steps: 24
 
 checkpoint_interval: 5000
 log_interval: 100

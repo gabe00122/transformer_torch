@@ -57,9 +57,9 @@ def train(cfg: DictConfig) -> None:
     model = model.to(device)    
     train_step_compiled = train_step #torch.compile(train_step, fullgraph=True)
     if True:
-        train_step_compiled = torch.compile(train_step, fullgraph=True)
+        train_step_compiled = torch.compile(train_step, fullgraph=True, mode="max-autotune-no-cudagraphs", dynamic=False)
 
-    # wandb.init(project="sentiment_lm_torch")
+    wandb.init(project="sentiment_lm_torch")
 
     loss_metric = 0
 
@@ -81,10 +81,11 @@ def train(cfg: DictConfig) -> None:
             scheduler.step()
 
             console.print(f"Step {step}, Loss: {loss_metric}")
-            # wandb.log({"loss": loss_metric}, step=step)
+            wandb.log({"loss": loss_metric}, step=step)
             loss_metric = 0
 
-    # torch.save(model.state_dict(), "checkpoints/model.pth")
+    torch.save(model.state_dict(), "checkpoints/model2.pth")
+    # torch.save(model.state_dict(), "model.pth")
 
 
 def loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
