@@ -57,7 +57,6 @@ class TransformerModel(nn.Module):
         *,
         activation: nn.Module = nn.SiLU(),
         glu: bool = True,
-        context_size: int,
         dtype: torch.dtype=torch.float32,
     ):
         super().__init__()
@@ -69,11 +68,11 @@ class TransformerModel(nn.Module):
         
         self.activation = activation
         self.glu = glu
-        self.context_size = context_size
         self.dtype = dtype
 
-        attention_mask = torch.tril(torch.ones((self.context_size, self.context_size), dtype=torch.bool))
-        self.register_buffer("attention_mask", attention_mask)
+        # remove this attention mask
+        # attention_mask = torch.tril(torch.ones((128, 128), dtype=torch.bool))
+        # self.register_buffer("attention_mask", attention_mask)
 
         self.embedder = Embedder(vocab_size, d_model)
 

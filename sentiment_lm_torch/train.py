@@ -28,7 +28,7 @@ from sentiment_lm_torch.constants import EMPTY_TOKEN
 def train(cfg: DictConfig) -> None:
     console = Console()
 
-    torch.set_float32_matmul_precision('high')
+    # torch.set_float32_matmul_precision('high')
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = cfg.batch_size // cfg.accumulation_steps
 
@@ -45,7 +45,7 @@ def train(cfg: DictConfig) -> None:
     total_gradient_steps = total_steps // cfg.accumulation_steps
     total_tokens = len(training_dataloader) * batch_size * context_size
 
-    model: nn.Module = instantiate(cfg.model, vocab_size=vocab_size, context_size=context_size)
+    model: nn.Module = instantiate(cfg.model, vocab_size=vocab_size)
     model.apply(init_weights)
 
     optimizer = instantiate(cfg.optimizer,model.parameters(), fused=True)
@@ -59,7 +59,7 @@ def train(cfg: DictConfig) -> None:
     if True:
         train_step_compiled = torch.compile(train_step, fullgraph=True, mode="max-autotune-no-cudagraphs", dynamic=False)
 
-    wandb.init(project="sentiment_lm_torch")
+    # wandb.init(project="sentiment_lm_torch")
 
     loss_metric = 0
 
@@ -81,10 +81,10 @@ def train(cfg: DictConfig) -> None:
             scheduler.step()
 
             console.print(f"Step {step}, Loss: {loss_metric}")
-            wandb.log({"loss": loss_metric}, step=step)
+            # wandb.log({"loss": loss_metric}, step=step)
             loss_metric = 0
 
-    torch.save(model.state_dict(), "checkpoints/model2.pth")
+    torch.save(model.state_dict(), "checkpoints/model3.pth")
     # torch.save(model.state_dict(), "model.pth")
 
 
@@ -100,6 +100,7 @@ def train_step(model, tokens, accumulation_steps,  rope_cache: tuple[Tensor, Ten
     labels = tokens[:, 1:]
 
     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        # todo: join the rope_cache and block_mask into a object for convenience
         logits = model(input_tokens, rope_cache, block_mask)
         return loss_fn(logits, labels) / accumulation_steps
 

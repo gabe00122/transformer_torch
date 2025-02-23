@@ -24,10 +24,10 @@ class Tokenizer:
             tokens.append(STAR_TOKENS[stars - 1])
 
         # pad
-        pad_size = len(tokens)
-        tokens.extend([EMPTY_TOKEN] * (self.context_size - pad_size))
+        length = len(tokens)
+        tokens.extend([EMPTY_TOKEN] * (self.context_size - length))
 
-        return tokens, pad_size
+        return tokens, length
 
     def decode_context(self, tokens: list[int]) -> str:
         tokens = [x - SPECIAL_TOKENS for x in tokens if x >= 0]
