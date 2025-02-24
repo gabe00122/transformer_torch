@@ -1,8 +1,8 @@
 from functools import lru_cache
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn, Tensor
+
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask, BlockMask
 
 from einops import rearrange
@@ -17,6 +17,16 @@ def causal_block_mask(seq_len: int):
 
     block_mask = create_block_mask(causal, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len)
     return block_mask
+
+
+def causal_attention(query: Tensor, key: Tensor, value: Tensor, block_mask: BlockMask | None) -> Tensor:
+    key = rearrange(key, "... seq heads d -> ... heads seq d")
+    query = rearrange(query, "... seq heads d -> ... heads seq d")
+    value = rearrange(value, "... seq heads d -> ... heads seq d")
+    
+    out = flex_attention(query, key, value, block_mask=block_mask)
+    out = rearrange(out, "... heads seq qkv -> ... seq (heads qkv)")
+    return out
 
 
 class AttentionBlock(nn.Module):
@@ -55,18 +65,35 @@ class AttentionBlock(nn.Module):
             bias=False,
             dtype=self.dtype,
         )
+    
+    def init_kv_cache(self, batch_size: int, context_size: int, device: torch.device, dtype: torch.dtype):
+        shape = (batch_size, context_size, self.num_heads, self.head_dim)
+        key_cache = torch.zeros(shape, device=device, dtype=dtype)
+        value_cache = torch.zeros(shape, device=device, dtype=dtype)
 
-    def forward(self, inputs: torch.Tensor, rope_cache: tuple[torch.Tensor, torch.Tensor], block_mask: BlockMask) -> torch.Tensor:
+        self.register_buffer("key_cache", key_cache, persistent=False)
+        self.register_buffer("value_cache", value_cache, persistent=False)
+        self.has_kv_cache = True
+
+    def update_kv_cache(self, positions: Tensor, key: Tensor, value: Tensor):
+        batch_idx = torch.arange(self.key_cache.shape[0], device=positions.device, dtype=torch.int64)
+        self.key_cache[batch_idx, positions] = key
+        self.value_cache[batch_idx, positions] = value
+
+        return self.key_cache, self.value_cache
+
+    def forward(self, inputs: torch.Tensor, positions: Tensor, block_mask: BlockMask | None = None) -> torch.Tensor:        
         in_proj = self.in_proj(inputs)
-        in_proj = rearrange(in_proj, "... seq (heads qkv) -> ... heads seq qkv", heads=self.num_heads)
+        in_proj = rearrange(in_proj, "... seq (heads qkv) -> ... seq heads qkv", heads=self.num_heads)
         query, key, value = torch.chunk(in_proj, 3, -1)
 
-        query = apply_rope(query, rope_cache)
-        key = apply_rope(key, rope_cache)
+        query = apply_rope(query, positions)
+        key = apply_rope(key, positions)
 
-        x = flex_attention(query, key, value, block_mask=block_mask)
-        
-        x = rearrange(x, "... heads seq qkv -> ... seq (heads qkv)")
+        if self.has_kv_cache:
+            key, value = self.update_kv_cache(positions, key, value)
+
+        x = causal_attention(query, key, value, block_mask=block_mask)
         x = self.out_proj(x)
 
         return x

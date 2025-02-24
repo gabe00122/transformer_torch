@@ -35,9 +35,9 @@ class TransformerLayer(nn.Module):
         ff_block = GLUBlock if glu else FFBlock
         self.ffn = ff_block(d_model, ffn_size, activation=activation)
 
-    def forward(self, x: Tensor, rope_cache: tuple[Tensor, Tensor], block_mask: BlockMask) -> Tensor:
+    def forward(self, x: Tensor, positions: Tensor, block_mask: BlockMask | None = None) -> Tensor:
         attention_input = self.attention_norm(x)
-        attention = self.attention(attention_input, rope_cache, block_mask)
+        attention = self.attention(attention_input, positions, block_mask=block_mask)
         x = x + attention
 
         feed_forward_input = self.ffn_norm(x)
@@ -70,10 +70,6 @@ class TransformerModel(nn.Module):
         self.glu = glu
         self.dtype = dtype
 
-        # remove this attention mask
-        # attention_mask = torch.tril(torch.ones((128, 128), dtype=torch.bool))
-        # self.register_buffer("attention_mask", attention_mask)
-
         self.embedder = Embedder(vocab_size, d_model)
 
         layers = []
@@ -91,12 +87,16 @@ class TransformerModel(nn.Module):
         self.layers = nn.ModuleList(layers)
 
         self.output_norm = nn.RMSNorm(d_model, dtype=dtype)
+    
+    def init_kv_cache(self, batch_size: int, context_size: int, device: torch.device, dtype: torch.dtype):
+        for layer in self.layers:
+            layer.attention.init_kv_cache(batch_size, context_size, device, dtype)
 
-    def forward(self, inputs: Tensor, rope_cache: tuple[Tensor, Tensor], block_mask: BlockMask) -> Tensor:
+    def forward(self, inputs: Tensor, positions: Tensor, block_mask: BlockMask | None = None) -> Tensor:
         x = self.embedder(inputs, decode=False)
 
         for layer in self.layers:
-            x = layer(x, rope_cache, block_mask)
+            x = layer(x, positions, block_mask=block_mask)
 
         x = self.output_norm(x)
         x = self.embedder(x, decode=True)
