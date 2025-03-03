@@ -74,6 +74,10 @@ class AttentionBlock(nn.Module):
         self.register_buffer("key_cache", key_cache, persistent=False)
         self.register_buffer("value_cache", value_cache, persistent=False)
         self.has_kv_cache = True
+    
+    def clear_kv_cache(self):
+        self.key_cache.zero_()
+        self.value_cache.zero_()
 
     def update_kv_cache(self, positions: Tensor, key: Tensor, value: Tensor):
         batch_idx = torch.arange(self.key_cache.shape[0], device=positions.device, dtype=torch.int64)

@@ -9,6 +9,7 @@ from torch.distributions import Categorical
 from rich.console import Console
 
 from sentiment_lm_torch.constants import SPECIAL_TOKENS, START_TOKEN
+from sentiment_lm_torch.model.transformer import TransformerModel
 
 
 @torch.compile(mode="max-autotune", dynamic=False, fullgraph=True)
@@ -35,7 +36,7 @@ def benchmark():
 
     batch = 64
 
-    model: nn.Module = instantiate(cfg.model, vocab_size=vocab_size)
+    model: TransformerModel = instantiate(cfg.model, vocab_size=vocab_size)
     
     sd = torch.load("./model.pth")
     model.load_state_dict(sd)
@@ -45,10 +46,11 @@ def benchmark():
     model.init_kv_cache(batch, context_size, device, torch.bfloat16)
 
     def benchmark_nocache():
-        tokens = torch.tensor([[START_TOKEN]] * batch, dtype=torch.int64, device=device)
-        positions = torch.tensor([[0]] * batch, dtype=torch.int64, device=device)
+        tokens = torch.ones((batch, 1), dtype=torch.int64, device=device)
+        positions = torch.zeros((batch, 1), dtype=torch.int64, device=device)
 
         # model.init_kv_cache(batch, context_size, device, torch.bfloat16)
+        model.clear_kv_cache()
 
         for _ in range(context_size - 1):
             with torch.no_grad():
