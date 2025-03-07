@@ -1,9 +1,14 @@
+from turtle import done
 import torch
-from torch import nn
+from torch import nn, Tensor
 from torch.distributions import Categorical, Distribution
+from torch.nn.attention.flex_attention import BlockMask
+
+from rich.console import Console
 
 from sentiment_lm_torch.model.transformer import TransformerLayer
 from sentiment_lm_torch.model.util import init_weights
+from sentiment_lm_torch.utils import get_param_count, abbreviate_number
 
 class ObservationEncoder(nn.Module):
     def __init__(self, d_model: int):
@@ -22,7 +27,8 @@ class PolicyHead(nn.Module):
         self.linear = nn.Linear(d_model, action_dim)
 
     def forward(self, x: torch.Tensor) -> Distribution:
-        return Categorical(logits=self.linear(x))
+        logits = self.linear(x) / 100.0
+        return Categorical(logits=logits)
 
 
 class ValueHead(nn.Module):
@@ -62,9 +68,6 @@ class RLTransformerModel(nn.Module):
         self.context_size = context_size
         self.dtype = dtype
 
-        attention_mask = torch.tril(torch.ones((self.context_size, self.context_size), dtype=torch.bool))
-        self.register_buffer("attention_mask", attention_mask)
-
         layers = []
         for _ in range(num_layers):
             layers.append(
@@ -85,11 +88,19 @@ class RLTransformerModel(nn.Module):
         self.policy_head = PolicyHead(d_model, action_dim)
         self.value_head = ValueHead(d_model)
 
-    def forward(self, inputs: torch.Tensor, segment_positions: torch.Tensor) -> tuple[Distribution, torch.Tensor]:
+    def init_kv_cache(self, batch_size: int, context_size: int, device: torch.device, dtype: torch.dtype):
+        for layer in self.layers:
+            layer.attention.init_kv_cache(batch_size, context_size, device, dtype)
+
+    def clear_kv_cache(self):
+        for layer in self.layers:
+            layer.attention.clear_kv_cache()
+
+    def forward(self, inputs: torch.Tensor, positions: Tensor, block_mask: BlockMask | None = None) -> tuple[Distribution, torch.Tensor]:
         x = self.observation_encoder(inputs)
 
         for layer in self.layers:
-            x = layer(x, segment_positions, self.attention_mask)
+            x = layer(x, positions, block_mask)
 
         x = self.output_norm(x)
 
@@ -151,52 +162,78 @@ def loss_fn(model: RLTransformerModel, observations: torch.Tensor, actions: torc
 import gymnasium as gym
 
 
-def sample_action(model: RLTransformerModel, obs_buffer: torch.Tensor, time_step_index: torch.Tensor) -> torch.Tensor:
-    # time_step_index (batchsize,)
+def sample_action(model: RLTransformerModel, obs: Tensor, positions: Tensor) -> Tensor:
+    with torch.no_grad():
+        policy, _ = model(obs[:, None, ...], positions)
+        action: Tensor = policy.sample()
+        action = action.squeeze(-1)
+        return action
 
-    segment_positions = torch.arange(obs_buffer.shape[1], device=obs_buffer.device)
-    policy, _ = model(obs_buffer, segment_positions)
-    action = policy.sample()
-    action = action[:, time_step_index]
-    return action
+def rollout(model: RLTransformerModel, env: gym.vector.VectorEnv, trajectory_length: int):
+    batch_size = 2
+    device = torch.device("cuda")
+
+    obs_rollout = torch.zeros((batch_size, trajectory_length, 4), device=device, dtype=torch.float32)
+    action_rollout = torch.zeros((batch_size, trajectory_length), device=device, dtype=torch.int64)
+    reward_rollout = torch.zeros((batch_size, trajectory_length), device=device, dtype=torch.float32)
+    terminated_rollout = torch.zeros((batch_size, trajectory_length), device=device, dtype=torch.bool)
+
+    model.eval()
+    model.init_kv_cache(batch_size, trajectory_length, device=device, dtype=torch.float32)
+
+    obs, info = env.reset()
+    torch_obs = torch.from_numpy(obs).to(device)
+    positions = torch.zeros((batch_size, 1), device=device, dtype=torch.int64)
+
+    batch_idx = torch.arange(batch_size, device=device, dtype=torch.int64)
+    obs_rollout[batch_idx, positions] = torch_obs
+
+    done = False
+    while not done:
+        action = sample_action(model, torch_obs, positions)
+        obs, reward, terminated, truncated, info = env.step(action.cpu().numpy())
+        torch_obs = torch.from_numpy(obs).to(device)
+        positions += 1
+
+        obs_rollout[batch_idx, positions] = torch_obs
+        action_rollout[batch_idx, positions] = action
+        reward_rollout[batch_idx, positions] = torch.from_numpy(reward).to(device)
+        terminated_rollout[batch_idx, positions] = torch.from_numpy(terminated).to(device)
+
+        done = terminated[0] or truncated[0]
+
+
+    model.train()
+    positions = torch.arange(trajectory_length, device=device, dtype=torch.int64)
+    policy, value = model(obs_rollout, positions[None, :])
+    breakpoint()
+
 
 
 def train():
-    batch_size = 1
+    console = Console()
+
+    batch_size = 2
 
     env = gym.make_vec("CartPole-v1", num_envs=batch_size, render_mode="human")
 
     model = RLTransformerModel(
         action_dim=env.single_action_space.n,
         num_layers=2,
-        num_heads=2,
-        d_model=100,
-        ffn_size=100,
+        num_heads=4,
+        d_model=128,
+        ffn_size=128,
         context_size=500,
         activation=nn.SiLU(),
         glu=False,
     )
     model.apply(init_weights)
+    model.to("cuda")
 
     trajectory_length = 500
     observation_dim = 4
 
-    time_step_index = torch.zeros((batch_size,), dtype=torch.int)
-    obs_buffer = torch.zeros((batch_size, trajectory_length, observation_dim), dtype=torch.float32)
-
-    obs, info = env.reset()
-    
-    obs_buffer[:, 0] = torch.from_numpy(obs).float()
-    actions = sample_action(model, obs_buffer, time_step_index)
-
-    for _ in range(1, trajectory_length):
-        obs, rewards, terminated, truncated, info = env.step(actions.numpy())
-
-        obs_buffer[:, time_step_index + 1] = torch.from_numpy(obs).float()
-        time_step_index += 1
-
-        if terminated or truncated:
-            break
+    rollout(model, env, trajectory_length)
         
 if __name__ == "__main__":
     train()
