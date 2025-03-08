@@ -10,7 +10,6 @@ from einops import rearrange
 from sentiment_lm_torch.model.positional_embeddings import apply_rope
 
 
-@lru_cache
 def causal_block_mask(seq_len: int):
     def causal(b, h, q_idx, kv_idx):
         return q_idx >= kv_idx
@@ -19,7 +18,7 @@ def causal_block_mask(seq_len: int):
     return block_mask
 
 
-def causal_attention(query: Tensor, key: Tensor, value: Tensor, block_mask: BlockMask | None) -> Tensor:
+def attention(query: Tensor, key: Tensor, value: Tensor, block_mask: BlockMask | None) -> Tensor:
     key = rearrange(key, "... seq heads d -> ... heads seq d")
     query = rearrange(query, "... seq heads d -> ... heads seq d")
     value = rearrange(value, "... seq heads d -> ... heads seq d")
@@ -94,10 +93,10 @@ class AttentionBlock(nn.Module):
         query = apply_rope(query, positions)
         key = apply_rope(key, positions)
 
-        if self.has_kv_cache:
+        if self.has_kv_cache and not self.training:
             key, value = self.update_kv_cache(positions, key, value)
 
-        x = causal_attention(query, key, value, block_mask=block_mask)
+        x = attention(query, key, value, block_mask=block_mask)
         x = self.out_proj(x)
 
         return x

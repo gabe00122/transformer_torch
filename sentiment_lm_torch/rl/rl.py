@@ -9,6 +9,7 @@ from rich.console import Console
 from sentiment_lm_torch.model.transformer import TransformerLayer
 from sentiment_lm_torch.model.util import init_weights
 from sentiment_lm_torch.utils import get_param_count, abbreviate_number
+from sentiment_lm_torch.model.attention import causal_block_mask
 
 class ObservationEncoder(nn.Module):
     def __init__(self, d_model: int):
@@ -88,15 +89,22 @@ class RLTransformerModel(nn.Module):
         self.policy_head = PolicyHead(d_model, action_dim)
         self.value_head = ValueHead(d_model)
 
-    def init_kv_cache(self, batch_size: int, context_size: int, device: torch.device, dtype: torch.dtype):
+    def create_kv_cache(self, batch_size: int, context_size: int, device: torch.device, dtype: torch.dtype = torch.float32):
         for layer in self.layers:
             layer.attention.init_kv_cache(batch_size, context_size, device, dtype)
 
     def clear_kv_cache(self):
         for layer in self.layers:
             layer.attention.clear_kv_cache()
+    
+    def create_block_mask(self, seq_length: int):
+        self.block_mask = causal_block_mask(seq_length)
 
-    def forward(self, inputs: torch.Tensor, positions: Tensor, block_mask: BlockMask | None = None) -> tuple[Distribution, torch.Tensor]:
+    def forward(self, inputs: torch.Tensor, positions: Tensor) -> tuple[Distribution, torch.Tensor]:
+        block_mask: BlockMask | None = None
+        if self.training:
+            block_mask = self.block_mask
+        
         x = self.observation_encoder(inputs)
 
         for layer in self.layers:
@@ -121,19 +129,23 @@ def loss_fn(model: RLTransformerModel, observations: torch.Tensor, actions: torc
     discount = 0.99
     actor_coef = 1.0
     entropy_coef = 0.01
+    seq_length = observations.shape[1]
     
     # Compute the policy loss
-    segment_positions = torch.arange(observations.shape[1], device=observations.device)
+    positions = torch.arange(seq_length, device=observations.device)
 
     # Observation dimensions: (batch_size, context_size, ...)
 
-    policy, values = model(observations, segment_positions)
+    policy, values = model(observations, positions)
 
-    next_values = torch.cat([values[:, 1:], torch.zeros((values.size(0), 1), device=values.device)], dim=1)
+    breakpoint()
+    next_values = torch.roll(values, shifts=-1, dims=-1)
+    next_values[:, -1] = 0.0
+
 
     next_values = next_values.detach()
 
-    target = rewards + discount * next_values * (1.0 - terminated)
+    target = rewards + discount * next_values * ~terminated
     
     temporal_difference_error = target - values
 
@@ -170,8 +182,9 @@ def sample_action(model: RLTransformerModel, obs: Tensor, positions: Tensor) -> 
         return action
 
 def rollout(model: RLTransformerModel, env: gym.vector.VectorEnv, trajectory_length: int):
-    batch_size = 2
+    batch_size = env.num_envs
     device = torch.device("cuda")
+    # breakpoint()
 
     obs_rollout = torch.zeros((batch_size, trajectory_length, 4), device=device, dtype=torch.float32)
     action_rollout = torch.zeros((batch_size, trajectory_length), device=device, dtype=torch.int64)
@@ -179,7 +192,6 @@ def rollout(model: RLTransformerModel, env: gym.vector.VectorEnv, trajectory_len
     terminated_rollout = torch.zeros((batch_size, trajectory_length), device=device, dtype=torch.bool)
 
     model.eval()
-    model.init_kv_cache(batch_size, trajectory_length, device=device, dtype=torch.float32)
 
     obs, info = env.reset()
     torch_obs = torch.from_numpy(obs).to(device)
@@ -188,25 +200,26 @@ def rollout(model: RLTransformerModel, env: gym.vector.VectorEnv, trajectory_len
     batch_idx = torch.arange(batch_size, device=device, dtype=torch.int64)
     obs_rollout[batch_idx, positions] = torch_obs
 
-    done = False
-    while not done:
+    # done = False
+    for i in range(trajectory_length):
         action = sample_action(model, torch_obs, positions)
         obs, reward, terminated, truncated, info = env.step(action.cpu().numpy())
         torch_obs = torch.from_numpy(obs).to(device)
-        positions += 1
 
-        obs_rollout[batch_idx, positions] = torch_obs
         action_rollout[batch_idx, positions] = action
         reward_rollout[batch_idx, positions] = torch.from_numpy(reward).to(device)
         terminated_rollout[batch_idx, positions] = torch.from_numpy(terminated).to(device)
 
-        done = terminated[0] or truncated[0]
+        if i < trajectory_length - 1:
+            positions += 1
+            obs_rollout[batch_idx, positions] = torch_obs
+
+        # done = terminated[0] or truncated[0]
 
 
     model.train()
-    positions = torch.arange(trajectory_length, device=device, dtype=torch.int64)
-    policy, value = model(obs_rollout, positions[None, :])
-    breakpoint()
+    loss = loss_fn(model, obs_rollout, action_rollout, reward_rollout, terminated_rollout)
+    print(loss)
 
 
 
@@ -214,6 +227,8 @@ def train():
     console = Console()
 
     batch_size = 2
+    trajectory_length = 512
+    device = torch.device("cuda")
 
     env = gym.make_vec("CartPole-v1", num_envs=batch_size, render_mode="human")
 
@@ -228,10 +243,10 @@ def train():
         glu=False,
     )
     model.apply(init_weights)
-    model.to("cuda")
+    model.create_kv_cache(batch_size, trajectory_length, device=device)
+    model.create_block_mask(trajectory_length)
 
-    trajectory_length = 500
-    observation_dim = 4
+    model.to(device)
 
     rollout(model, env, trajectory_length)
         
