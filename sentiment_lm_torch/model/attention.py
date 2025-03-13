@@ -1,22 +1,22 @@
+import math
 import torch
 from torch import nn, Tensor
+from torch.nn import functional as F
 
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask, BlockMask
-
 from einops import rearrange
 
 from sentiment_lm_torch.model.positional_embeddings import apply_rope
 
-
-def causal_block_mask(seq_len: int):
+def causal_block_mask(seq_len: int, device: str = "cuda"):
     def causal(b, h, q_idx, kv_idx):
         return q_idx >= kv_idx
 
-    block_mask = create_block_mask(causal, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len)
+    block_mask = create_block_mask(causal, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device)
     return block_mask
 
 
-def attention(query: Tensor, key: Tensor, value: Tensor, block_mask: BlockMask | None) -> Tensor:
+def flex_attention_wrapper(query: Tensor, key: Tensor, value: Tensor, block_mask: BlockMask | None) -> Tensor:
     key = rearrange(key, "... seq heads d -> ... heads seq d")
     query = rearrange(query, "... seq heads d -> ... heads seq d")
     value = rearrange(value, "... seq heads d -> ... heads seq d")
@@ -25,6 +25,28 @@ def attention(query: Tensor, key: Tensor, value: Tensor, block_mask: BlockMask |
     out = rearrange(out, "... heads seq qkv -> ... seq (heads qkv)")
     return out
 
+def position_mask(positions: Tensor, max_seq_length: int) -> Tensor:
+    seq_range = torch.arange(max_seq_length, dtype=torch.int64, device=positions.device)
+    mask = seq_range[None, None, :] <= positions[:, :, None]
+    return mask[:, None, :, :]
+
+def einsum_attention(query: Tensor, key: Tensor, value: Tensor, positions: Tensor) -> Tensor:
+    max_seq_length = key.size(-3)
+    mask = position_mask(positions, max_seq_length)
+    
+    depth = float(query.shape[-1])
+    query = query / math.sqrt(depth)
+    
+    attn_weights = torch.einsum("...qhd,...khd->...hqk", query, key)
+ 
+    big_neg = torch.finfo(attn_weights.dtype).min
+    attn_weights = torch.where(mask, attn_weights, big_neg)
+ 
+    attn_weights = F.softmax(attn_weights, -1)
+ 
+    x = torch.einsum("...hqk,...khd->...qhd", attn_weights, value)
+    x = rearrange(x, "... seq heads d -> ... seq (heads d)")
+    return x
 
 class AttentionBlock(nn.Module):
     def __init__(
@@ -32,14 +54,13 @@ class AttentionBlock(nn.Module):
         num_heads: int,
         d_model: int,
         *,
-        use_flex_attention: bool = True,
         dtype: torch.dtype = torch.float32
     ):
         super().__init__()
         self.num_heads = num_heads
         self.d_model = d_model
         self.dtype = dtype
-        self.use_flex_attention = use_flex_attention
+        self.has_kv_cache = False
 
         if self.d_model % self.num_heads != 0:
             raise ValueError(
@@ -94,7 +115,10 @@ class AttentionBlock(nn.Module):
         if self.has_kv_cache and not self.training:
             key, value = self.update_kv_cache(positions, key, value)
 
-        x = attention(query, key, value, block_mask=block_mask)
+        if self.training:
+            x = flex_attention_wrapper(query, key, value, block_mask=block_mask)
+        else:
+            x = einsum_attention(query, key, value, positions)
         x = self.out_proj(x)
 
         return x
