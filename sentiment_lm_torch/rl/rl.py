@@ -20,6 +20,7 @@ class ObservationEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.linear(x)
+        x = F.leaky_relu(x)
 
         return x
 
@@ -29,9 +30,12 @@ class PolicyHead(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.action_dim = action_dim
+        self.p_linear = nn.Linear(d_model, d_model)
         self.linear = nn.Linear(d_model, self.action_dim)
 
     def forward(self, x: torch.Tensor) -> Distribution:
+        x = self.p_linear(x)
+        x = F.leaky_relu(x)
         x = self.linear(x)
 
         if self.training:
@@ -45,13 +49,13 @@ class ValueHead(nn.Module):
         super().__init__()
         self.d_model = d_model
 
-        # self.in_linear = nn.Linear(d_model, d_model)
+        self.p_linear = nn.Linear(d_model, d_model)
         self.activation = nn.LeakyReLU()
         self.out_linear = nn.Linear(d_model, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x = self.in_linear(x)
-        # x = self.activation(x)
+        x = self.p_linear(x)
+        x = F.leaky_relu(x)
         x = self.out_linear(x)
         return x
 
@@ -81,9 +85,9 @@ class RLTransformerModel(nn.Module):
         self.glu = glu
         self.dtype = dtype
 
-        actor_layers = []
+        layers = []
         for _ in range(num_layers):
-            actor_layers.append(
+            layers.append(
                 TransformerLayer(
                     num_heads,
                     d_model,
@@ -93,79 +97,48 @@ class RLTransformerModel(nn.Module):
                     dtype=dtype,
                 )
             )
-        self.actor_layers = nn.ModuleList(actor_layers)
+        self.layers = nn.ModuleList(layers)
 
-        critic_layers = []
-        for _ in range(num_layers):
-            critic_layers.append(
-                TransformerLayer(
-                    num_heads,
-                    d_model,
-                    ffn_size,
-                    activation=self.activation,
-                    glu=glu,
-                    dtype=dtype,
-                )
-            )
-        self.critic_layers = nn.ModuleList(critic_layers)
+        self.output_norm = nn.LayerNorm(d_model, dtype=dtype)
 
-        self.actor_output_norm = nn.LayerNorm(d_model, dtype=dtype)
-        self.critic_output_norm = nn.LayerNorm(d_model, dtype=dtype)
-
-        self.actor_observation_encoder = ObservationEncoder(d_model)
-        self.critic_observation_encoder = ObservationEncoder(d_model)
+        self.observation_encoder = ObservationEncoder(d_model)
         self.policy_head = PolicyHead(d_model, action_dim)
         self.value_head = ValueHead(d_model)
 
     def create_kv_cache(self, batch_size: int, context_size: int, device: torch.device, dtype: torch.dtype = torch.float32):
-        for layer in self.actor_layers:
-            layer.attention.init_kv_cache(batch_size, context_size, device, dtype)
-        
-        for layer in self.critic_layers:
+        for layer in self.layers:
             layer.attention.init_kv_cache(batch_size, context_size, device, dtype)
 
     def clear_kv_cache(self):
-        for layer in self.actor_layers:
-            layer.attention.clear_kv_cache()
-        
-        for layer in self.critic_layers:
+        for layer in self.layers:
             layer.attention.clear_kv_cache()
 
     def forward(self, inputs: torch.Tensor, positions: Tensor, *, policy_only: bool = False, block_mask: BlockMask | None = None) -> tuple[Distribution, torch.Tensor]:
-        ax = self.actor_observation_encoder(inputs)
+        x = self.observation_encoder(inputs)
 
-        for layer in self.actor_layers:
-            ax = layer(ax, positions, block_mask)
+        for layer in self.layers:
+            x = layer(x, positions, block_mask)
 
-        ax = self.actor_output_norm(ax)
+        x = self.output_norm(x)
 
-        policy = self.policy_head(ax)
+        policy = self.policy_head(x)
         if policy_only:
             return policy
-        
-        cx = self.critic_observation_encoder(inputs)
 
-        for layer in self.critic_layers:
-            cx = layer(cx, positions, block_mask)
-
-        cx = self.critic_output_norm(cx)
-
-        value = self.value_head(cx)
+        value = self.value_head(x)
         value = value.squeeze(-1)
 
         return policy, value
 
+_positions = torch.arange(64, device=torch.device("cuda"), dtype=torch.int64)
 
 def loss_fn(model: RLTransformerModel, observations: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor, terminated: torch.Tensor, truncated: torch.Tensor, block_mask: BlockMask) -> torch.Tensor:
     discount = 0.99
-    actor_coef = 1.0
-    entropy_coef = 0.01 #0.0001
-    seq_length = observations.shape[1]
-    
-    positions = torch.arange(seq_length, device=observations.device)
+    actor_coef = 0.2
+    # entropy_coef = 0.1 #0.0001
 
     # Observation dimensions: (batch_size, context_size, ...)
-    policy, values = torch.compile(model, mode="max-autotune")(observations, positions[None, :], block_mask=block_mask)
+    policy, values = torch.compile(model, mode="max-autotune")(observations, _positions[None, :], block_mask=block_mask)
 
     next_values = values[:, 1:]
     values = values[:, :-1]
@@ -173,8 +146,6 @@ def loss_fn(model: RLTransformerModel, observations: torch.Tensor, actions: torc
     next_values = next_values.detach()
     with torch.no_grad():
         advantage, target = vec_generalized_advantage_estimate(discount, 1.0, values, next_values, rewards, terminated | truncated, terminated, time_dim=1)
-    # target = rewards + discount * next_values * ~terminated
-    # advantage = target - values
 
     # Critic loss
     critic_loss = F.smooth_l1_loss(values, target) # torch.square(target - values)
@@ -184,13 +155,13 @@ def loss_fn(model: RLTransformerModel, observations: torch.Tensor, actions: torc
     actor_loss = -(action_probability * advantage)
 
     # Entropy regularization
-    entropy = policy.entropy()
-    entropy_loss = -entropy
+    # entropy = policy.entropy()
+    # entropy_loss = -entropy
 
     total_loss = (
         critic_loss
         + actor_coef * actor_loss
-        + entropy_coef * entropy_loss
+        # + entropy_coef * entropy_loss
     ).mean()
 
     return total_loss, actor_loss.mean(), critic_loss.mean()
@@ -241,6 +212,8 @@ class Trainer:
         self.positions.zero_()
 
         obs, info = self.env.reset()
+        obs[..., 1] = 0.0
+        obs[..., 3] = 0.0
         obs_tensor = torch.from_numpy(obs).to(self.device)
 
         reward_tensor = torch.zeros(self.batch_size, device=self.device, dtype=torch.float32)
@@ -251,6 +224,8 @@ class Trainer:
             with torch.no_grad():
                 action = sample_action(self.model, obs_tensor, self.positions)
             obs, reward, terminated, truncated, _ = self.env.step(action.cpu().numpy())
+            obs[..., 1] = 0.0
+            obs[..., 3] = 0.0
             
             reward_tensor.copy_(torch.from_numpy(reward))
             terminated_tensor.copy_(torch.from_numpy(terminated))
@@ -263,6 +238,7 @@ class Trainer:
             self.truncated_rollout[:, i] = truncated_tensor
             
             obs_tensor.copy_(torch.from_numpy(obs))
+            # obs_tensor[..., 1] = terminated_tensor | truncated_tensor
             self.positions += 1
 
             # Update cumulative rewards
@@ -300,8 +276,8 @@ def train():
     torch.set_float32_matmul_precision('high')
     console = Console()
 
-    batch_size = 64
-    trajectory_length = 512
+    batch_size = 32
+    trajectory_length = 64
     device = torch.device("cuda")
 
     env = gym.vector.SyncVectorEnv([lambda: gym.make("CartPole-v1", render_mode="human" if i==0 else None) for i in range(batch_size)], autoreset_mode=gym.vector.AutoresetMode.NEXT_STEP)
@@ -309,21 +285,20 @@ def train():
     model = RLTransformerModel(
         action_dim=env.single_action_space.n,
         num_layers=2,
-        num_heads=4,
-        d_model=64,
-        ffn_size=64,
+        num_heads=8,
+        d_model=128,
+        ffn_size=256,
         activation=nn.LeakyReLU(),
         glu=False,
     )
     model.apply(init_weights)
-    # model.policy_head.linear2.weight.data /= 100.0
+    # model.policy_head.linear.weight.data /= 100.0
     model.create_kv_cache(batch_size, trajectory_length, device=device)
     # model.create_block_mask(trajectory_length)
 
     console.print(f"Model size: {abbreviate_number(get_param_count(model))} parameters")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.0001)
-    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=1000)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, betas=(0.97, 0.97))#lr=0.0007)
     model.to(device)
 
     model.eval()
@@ -334,8 +309,7 @@ def train():
     # Track cumulative rewards for monitoring
     best_mean_reward = 0.0
 
-    for epoch in track(range(1000), console=console, disable=True):
-        # optimizer.zero_grad()
+    for epoch in track(range(2000), console=console, disable=False):
 
         # mini_batches = 8
         # for _ in track(range(mini_batches), console=console, disable=True):
@@ -344,7 +318,7 @@ def train():
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        scheduler.step()
+        # scheduler.step()
         
         # Update best mean reward
         best_mean_reward = max(best_mean_reward, mean_reward)

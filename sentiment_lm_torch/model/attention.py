@@ -27,7 +27,7 @@ def flex_attention_wrapper(query: Tensor, key: Tensor, value: Tensor, block_mask
 
 def position_mask(positions: Tensor, max_seq_length: int) -> Tensor:
     seq_range = torch.arange(max_seq_length, dtype=torch.int64, device=positions.device)
-    mask = seq_range[None, None, :] <= positions[:, :, None]
+    mask = seq_range[None, None, :] <= positions[:, None]
     return mask[:, None, :, :]
 
 def einsum_attention(query: Tensor, key: Tensor, value: Tensor, positions: Tensor) -> Tensor:
@@ -38,6 +38,7 @@ def einsum_attention(query: Tensor, key: Tensor, value: Tensor, positions: Tenso
     query = query / math.sqrt(depth)
     
     attn_weights = torch.einsum("...qhd,...khd->...hqk", query, key)
+    breakpoint()
  
     big_neg = torch.finfo(attn_weights.dtype).min
     attn_weights = torch.where(mask, attn_weights, big_neg)
@@ -115,10 +116,10 @@ class AttentionBlock(nn.Module):
         if self.has_kv_cache and not self.training:
             key, value = self.update_kv_cache(positions, key, value)
 
-        if self.training:
-            x = flex_attention_wrapper(query, key, value, block_mask=block_mask)
-        else:
-            x = einsum_attention(query, key, value, positions)
+        # if self.training:
+        #     x = flex_attention_wrapper(query, key, value, block_mask=block_mask)
+        # else:
+        x = einsum_attention(query, key, value, positions)
         x = self.out_proj(x)
 
         return x
