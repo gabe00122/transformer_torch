@@ -14,8 +14,8 @@ class FFBlock(nn.Module):
         self.hidden_features = hidden_features
 
         self.activation = activation
-        self.up_proj = nn.Linear(d_model, hidden_features, bias=False)
-        self.down_proj = nn.Linear(hidden_features, d_model, bias=False)
+        self.up_proj = nn.Linear(d_model, hidden_features, bias=True)
+        self.down_proj = nn.Linear(hidden_features, d_model, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.up_proj(x)
@@ -37,8 +37,8 @@ class GLUBlock(nn.Module):
         self.hidden_features = hidden_features
         self.activation = activation
         
-        self.up_proj = nn.Linear(d_model, hidden_features * 2, bias=False)
-        self.down_proj = nn.Linear(hidden_features, d_model, bias=False)
+        self.up_proj = nn.Linear(d_model, hidden_features * 2, bias=True)
+        self.down_proj = nn.Linear(hidden_features, d_model, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.up_proj(x)

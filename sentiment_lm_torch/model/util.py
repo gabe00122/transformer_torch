@@ -21,7 +21,7 @@ def name_to_activation(name: str) -> torch.nn.Module:
 
 def init_weights(module: nn.Module) -> None:
     if isinstance(module, nn.Linear):
-        nn.init.xavier_normal_(module.weight)
+        nn.init.kaiming_uniform_(module.weight)
     elif isinstance(module, nn.LayerNorm):
         nn.init.constant_(module.weight, 1.0)
         nn.init.constant_(module.bias, 0.0)

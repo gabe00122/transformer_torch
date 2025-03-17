@@ -38,7 +38,6 @@ def einsum_attention(query: Tensor, key: Tensor, value: Tensor, positions: Tenso
     query = query / math.sqrt(depth)
     
     attn_weights = torch.einsum("...qhd,...khd->...hqk", query, key)
-    breakpoint()
  
     big_neg = torch.finfo(attn_weights.dtype).min
     attn_weights = torch.where(mask, attn_weights, big_neg)
@@ -74,14 +73,14 @@ class AttentionBlock(nn.Module):
         self.in_proj = nn.Linear(
             self.d_model,
             self.num_heads * self.head_dim * 3,
-            bias=False,
+            bias=True,
             dtype=self.dtype,
         )
 
         self.out_proj = nn.Linear(
             self.num_heads * self.head_dim,
             self.d_model,
-            bias=False,
+            bias=True,
             dtype=self.dtype,
         )
     
@@ -100,6 +99,7 @@ class AttentionBlock(nn.Module):
 
     def update_kv_cache(self, positions: Tensor, key: Tensor, value: Tensor):
         batch_idx = torch.arange(self.key_cache.shape[0], device=positions.device, dtype=torch.int64)
+        batch_idx = batch_idx[:, None]
         self.key_cache[batch_idx, positions] = key
         self.value_cache[batch_idx, positions] = value
 
@@ -116,10 +116,10 @@ class AttentionBlock(nn.Module):
         if self.has_kv_cache and not self.training:
             key, value = self.update_kv_cache(positions, key, value)
 
-        # if self.training:
-        #     x = flex_attention_wrapper(query, key, value, block_mask=block_mask)
-        # else:
-        x = einsum_attention(query, key, value, positions)
+        if self.training:
+            x = flex_attention_wrapper(query, key, value, block_mask=block_mask)
+        else:
+            x = einsum_attention(query, key, value, positions)
         x = self.out_proj(x)
 
         return x
