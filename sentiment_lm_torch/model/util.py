@@ -1,3 +1,4 @@
+from math import sqrt
 import torch
 from torch import nn
 
@@ -21,7 +22,11 @@ def name_to_activation(name: str) -> torch.nn.Module:
 
 def init_weights(module: nn.Module) -> None:
     if isinstance(module, nn.Linear):
-        nn.init.kaiming_uniform_(module.weight)
+        nn.init.orthogonal_(module.weight)
+        module.weight.data *= sqrt(2)
+    elif isinstance(module, nn.Conv2d):
+        nn.init.orthogonal_(module.weight)
+        module.weight.data *= sqrt(2)
     elif isinstance(module, nn.LayerNorm):
         nn.init.constant_(module.weight, 1.0)
         nn.init.constant_(module.bias, 0.0)

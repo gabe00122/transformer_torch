@@ -1,29 +1,72 @@
-import IPython
-import rich
 import torch
-from torch import log_, nn, Tensor
+from torch import nn, Tensor
 from torch.nn import functional as F
 from torch.distributions import Categorical, Distribution
 from torch.nn.attention.flex_attention import BlockMask
 from torchrl.objectives.value.functional import vec_generalized_advantage_estimate
 import gymnasium as gym
+from mettagrid.gym_wrapper import make, MultiToDiscreteWrapper
+
+from einops import rearrange
 
 from rich.console import Console
 from rich.progress import track
 
 from sentiment_lm_torch.model.transformer import TransformerLayer
 from sentiment_lm_torch.model.util import init_weights
+from sentiment_lm_torch.rl.metta_utils import ObservationNormalizer
 from sentiment_lm_torch.utils import get_param_count, abbreviate_number
 from sentiment_lm_torch.model.attention import causal_block_mask
 
-class ObservationEncoder(nn.Module):
-    def __init__(self, d_model: int):
+class MlpObservationEncoder(nn.Module):
+    def __init__(self, obs_dim: int, d_model: int):
         super().__init__()
-        self.linear = nn.Linear(4, d_model)
+        self.linear = nn.Linear(obs_dim, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.linear(x)
         x = F.leaky_relu(x)
+
+        return x
+
+def _convolution_shape(shape, kernel_size, stride):
+    return tuple((x - kernel_size) // stride + 1 for x in shape)
+
+class MetaCnnEncoder(nn.Module):
+    def __init__(
+        self,
+        img_shape: tuple[int, ...],
+        d_model: int,
+        activation: nn.Module,
+        channels=[32, 64],
+        *,
+        grid_features: list[str] = [],
+    ):
+        super().__init__()
+        C = img_shape[-1]
+        img_shape = img_shape[:-1]
+
+        self.conv1 = nn.Conv2d(C, channels[0], kernel_size=5, stride=3)
+        img_shape = _convolution_shape(img_shape, 5, 3)
+        self.conv2 = nn.Conv2d(channels[0], channels[1], kernel_size=3, stride=1)
+        img_shape = _convolution_shape(img_shape, 3, 1)
+        
+        self.linear = nn.Linear(img_shape[0] * img_shape[1] * channels[1], d_model)
+        self.activation = activation
+
+        self.object_normalizer = ObservationNormalizer(grid_features)
+
+    def forward(self, obs: torch.Tensor):
+        b, l, _, _, _ = obs.shape
+        obs = rearrange(obs, "b l h w c -> (b l) c h w")
+
+        if self.object_normalizer is not None:
+            obs = self.object_normalizer(obs)
+        
+        x = self.activation(self.conv1(obs))
+        x = self.activation(self.conv2(x))
+        x = rearrange(x, "(b l) c h w -> b l (h w c)", b=b, l=l)
+        x = self.linear(x)
 
         return x
 
@@ -37,6 +80,7 @@ class PolicyHead(nn.Module):
         self.linear = nn.Linear(d_model, self.action_dim)
 
     def forward(self, x: torch.Tensor) -> Distribution:
+        x = self.p_linear(x)
         x = F.leaky_relu(x)
         x = self.linear(x)
         
@@ -53,7 +97,8 @@ class ValueHead(nn.Module):
         self.out_linear = nn.Linear(d_model, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.leaky_relu(x)
+        x = self.p_linear(x)
+        x = self.activation(x)
         x = self.out_linear(x)
         return x
 
@@ -61,18 +106,19 @@ class ValueHead(nn.Module):
 class RLTransformerModel(nn.Module):
     def __init__(
         self,
-        action_dim: int,
         num_layers: int,
         num_heads: int,
         d_model: int,
         ffn_size: int,
+        observation_encoder: nn.Module,
+        policy_head: nn.Module,
+        value_head: nn.Module,
         *,
         activation: nn.Module = nn.SiLU(),
         glu: bool = True,
         dtype: torch.dtype=torch.float32,
     ):
         super().__init__()
-        self.action_dim = action_dim
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.d_model = d_model
@@ -98,9 +144,9 @@ class RLTransformerModel(nn.Module):
 
         self.output_norm = nn.LayerNorm(d_model, dtype=dtype)
 
-        self.observation_encoder = ObservationEncoder(d_model)
-        self.policy_head = PolicyHead(d_model, action_dim)
-        self.value_head = ValueHead(d_model)
+        self.observation_encoder = observation_encoder
+        self.policy_head = policy_head
+        self.value_head = value_head
 
     def create_kv_cache(self, batch_size: int, context_size: int, device: torch.device, dtype: torch.dtype = torch.float32):
         for layer in self.layers:
@@ -128,8 +174,8 @@ class RLTransformerModel(nn.Module):
 
 @torch.compile(mode="max-autotune", disable=True)
 def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    vf_coef = 0.2
-    entropy_coef = 0.002
+    vf_coef = 0.6
+    entropy_coef = 0.0 #0.00175
 
     vf_clip = 0.2
 
@@ -150,11 +196,8 @@ def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask
 
     ratio = torch.exp(log_probs - rollout.log_prob)
 
-    advantages = (rollout.advantage - rollout.advantage.mean()) / (rollout.advantage.std() + 1e-8)
-    # advantages = rollout.advantage
-
-    loss_actor1 = ratio * advantages
-    loss_actor2 = torch.clamp(ratio, 1.0 - vf_clip, 1.0 + vf_clip) * advantages
+    loss_actor1 = ratio * rollout.advantage
+    loss_actor2 = torch.clamp(ratio, 1.0 - vf_clip, 1.0 + vf_clip) * rollout.advantage
 
     actor_loss = -torch.min(loss_actor1, loss_actor2).mean()
 
@@ -179,9 +222,9 @@ def sample_action(model: RLTransformerModel, obs: Tensor, positions: Tensor) -> 
     return action, log_prob, value
 
 class Rollout:
-    def __init__(self, batch_size: int, trajectory_length: int, obs_dim: int, device: torch.device):
+    def __init__(self, batch_size: int, trajectory_length: int, obs_dims: tuple[int, ...], device: torch.device):
         # observation gets plus one because we need to store the next trailing observation
-        self.obs = torch.zeros((batch_size, trajectory_length, obs_dim), device=device, dtype=torch.float32)
+        self.obs = torch.zeros((batch_size, trajectory_length, *obs_dims), device=device, dtype=torch.float32)
         self.actions = torch.zeros((batch_size, trajectory_length), device=device, dtype=torch.int64)
         self.reward = torch.zeros((batch_size, trajectory_length), device=device, dtype=torch.float32)
         self.terminated = torch.zeros((batch_size, trajectory_length), device=device, dtype=torch.bool)
@@ -196,23 +239,27 @@ class Rollout:
     def calculate_advantage(self):
         values = self.values[:, :-1]
         next_values = self.values[:, 1:]
-        self.advantage, self.target = vec_generalized_advantage_estimate(0.97, 0.95, values, next_values, self.reward, self.truncated | self.terminated, self.terminated, time_dim=1)
+        self.advantage, self.target = vec_generalized_advantage_estimate(0.95, 0.87, values, next_values, self.reward, self.truncated | self.terminated, self.terminated, time_dim=1)
+        
+        # Normalize advantage
+        self.advantage = (self.advantage - self.advantage.mean()) / (self.advantage.std() + 1e-8)
+
 
 class Trainer:
     def __init__(self, model: RLTransformerModel, env: gym.vector.VectorEnv, trajectory_length: int, device: torch.device = torch.device("cuda")):
         self.model = model
         self.env = env
         self.trajectory_length = trajectory_length
-        self.batch_size = env.num_envs
+        self.batch_size = env.unwrapped.num_agents
         self.device = device
 
-        obs_dim = env.single_observation_space.shape[0]
+        obs_dims = env.unwrapped.single_observation_space.shape
 
         self.batch_idx = torch.arange(self.batch_size, device=device, dtype=torch.int64)
         self.positions = torch.zeros((self.batch_size, 1), device=self.device, dtype=torch.int64)
         
         # observation gets plus one because we need to store the next trailing observation
-        self.rollout = Rollout(self.batch_size, trajectory_length, obs_dim, device)
+        self.rollout = Rollout(self.batch_size, trajectory_length, obs_dims, device)
         
         # Track cumulative rewards per environment
         self.cumulative_rewards = torch.zeros(self.batch_size, device=device, dtype=torch.float32)
@@ -225,18 +272,15 @@ class Trainer:
         self.reward_tensor = torch.zeros(self.batch_size, device=self.device, dtype=torch.float32)
         self.terminated_tensor = torch.zeros(self.batch_size, device=self.device, dtype=torch.bool)
         self.truncated_tensor = torch.zeros(self.batch_size, device=self.device, dtype=torch.bool)
-        self.obs_tensor = torch.zeros((self.batch_size, obs_dim), device=self.device, dtype=torch.float32)
+        self.obs_tensor = torch.zeros((self.batch_size, *obs_dims), device=self.device, dtype=torch.float32)
 
     def create_rollout(self):
-        # self.model.clear_kv_cache()
         # Reset cumulative rewards for new episodes
         self.cumulative_rewards.zero_()
         self.episode_lengths.zero_()
         self.positions.zero_()
 
-        obs, info = self.env.reset()
-        obs[..., 1] = 0.0
-        obs[..., 3] = 0.0
+        obs, _ = self.env.reset()
         self.obs_tensor.copy_(torch.from_numpy(obs))
 
         for i in range(self.trajectory_length - 1):
@@ -244,8 +288,6 @@ class Trainer:
                 action, log_prob, value = sample_action(self.model, self.obs_tensor, self.positions)
             np_action = action.cpu().numpy()
             obs, reward, terminated, truncated, _ = self.env.step(np_action)
-            obs[..., 1] = terminated | truncated
-            obs[..., 3] = np_action / 2.0
             
             self.reward_tensor.copy_(torch.from_numpy(reward))
             self.terminated_tensor.copy_(torch.from_numpy(terminated))
@@ -261,35 +303,13 @@ class Trainer:
             
             self.obs_tensor.copy_(torch.from_numpy(obs))
             self.positions += 1
-
-            # Update cumulative rewards
-            self.cumulative_rewards += self.reward_tensor
-            self.episode_lengths += 1
-
-            # Track completed episodes
-            done_mask = self.terminated_tensor | self.truncated_tensor
-            if done_mask.any():
-                for env_idx in torch.where(done_mask)[0]:
-                    self.completed_episodes += 1
-                    self.completed_rewards.append(self.cumulative_rewards[env_idx].item())
-                    # Reset rewards and lengths for done environments
-                    self.cumulative_rewards[env_idx] = 0
-                    self.episode_lengths[env_idx] = 0
         
         with torch.no_grad():
             _, _, value = sample_action(self.model, self.obs_tensor, self.positions)
         self.rollout.values[:, -1] = value
 
-        # Calculate mean reward metrics
-        mean_reward = 0.0
-        if self.completed_rewards:
-            mean_reward = sum(self.completed_rewards) / len(self.completed_rewards)
-            # Keep only the most recent 100 episodes
-            if len(self.completed_rewards) > 100:
-                self.completed_rewards = self.completed_rewards[-100:]
-
         self.rollout.calculate_advantage()
-        return self.rollout, mean_reward
+        return self.rollout, self.rollout.reward.sum()
 
 
 
@@ -297,37 +317,56 @@ def train():
     torch.set_float32_matmul_precision('high')
     console = Console()
 
-    batch_size = 32
+    env = MultiToDiscreteWrapper(make("simple", overrides=["game.num_agents=60", "game.max_steps=512"]))
+    image_shape = env.unwrapped.single_observation_space.shape
+    action_dim = env.action_space.n
+    num_agents = env.unwrapped.num_agents
+
+    # image_shape = (image_shape[1], image_shape[2], image_shape[0])
+    print(image_shape)
+    print(action_dim)
+    print(num_agents)
+
+    batch_size = num_agents
     trajectory_length = 512
     device = torch.device("cuda")
 
-    env = gym.vector.SyncVectorEnv([lambda: gym.make("CartPole-v1") for _ in range(batch_size)], autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
+    d_model = 512
+    observation_encoder = MetaCnnEncoder(
+        img_shape=image_shape,
+        d_model=d_model,
+        activation=nn.LeakyReLU(),
+        channels=[32, 64],
+        grid_features=env.unwrapped.grid_features
+    )
+    policy_head = PolicyHead(d_model=d_model, action_dim=2)
+    value_head = ValueHead(d_model=d_model)
 
     model = RLTransformerModel(
-        action_dim=2,
-        num_layers=3,
+        num_layers=2,
         num_heads=8,
-        d_model=256,
-        ffn_size=256,
+        d_model=d_model,
+        ffn_size=d_model,
         activation=nn.LeakyReLU(),
         glu=False,
+        observation_encoder=observation_encoder,
+        policy_head=policy_head,
+        value_head=value_head,
     )
     model.apply(init_weights)
-    model.policy_head.linear.weight.data /= 100.0
-    # model.value_head.linear.weight.data *= 10.0
-    
+    nn.init.orthogonal_(model.policy_head.linear.weight)
+    model.policy_head.linear.weight.data *= 0.01
+    nn.init.orthogonal_(model.value_head.out_linear.weight)
+
     model.create_kv_cache(batch_size, trajectory_length, device=device)
-    # model.create_block_mask(trajectory_length)
 
+    # console.print(f"Cnn Size: {abbreviate_number(get_param_count(model.layers))}")
     console.print(f"Model size: {abbreviate_number(get_param_count(model))} parameters")
-
-    total_steps = 4000
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.00025, weight_decay=0.001, betas=(0.9, 0.9), eps=1e-12)#, weight_decay=0.001, betas=(0.9, 0.9), eps=1e-12)
+    
+    total_steps = 1_000
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0007)#, weight_decay=0.001, betas=(0.9, 0.9), eps=1e-12)
     scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=total_steps, start_factor=1.0, end_factor=0.0)
     model.to(device)
-
-    # model.eval()
-    # model(torch.zeros((batch_size, 1, 4), device=device), torch.zeros((batch_size, 1), device=device, dtype=torch.int64))
 
     trainer = Trainer(model, env, trajectory_length, device)
 
@@ -337,15 +376,14 @@ def train():
     for epoch in track(range(total_steps), console=console, disable=True):
         optimizer.zero_grad()
 
-        if epoch % 4 == 0:
+        if epoch % 3 == 0:
             model.eval()
             rollout, mean_reward = trainer.create_rollout()
-        # Debug required grad in the rollout
-        # print(f"Rollout: {rollout.obs.requires_grad}, {rollout.actions.requires_grad}, {rollout.reward.requires_grad}, {rollout.terminated.requires_grad}, {rollout.truncated.requires_grad}")
         
+        # breakpoint()
+
         model.train()
         loss, actor_loss, critic_loss = loss_fn(model, rollout, trainer.block_mask)
-        # loss.backward()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         optimizer.step()
@@ -355,9 +393,9 @@ def train():
         best_mean_reward = max(best_mean_reward, mean_reward)
         
         # Log metrics
-        console.print(f"[Step {epoch}] Loss: {loss.item():.4f} | Actor Loss: {actor_loss.item():.4f} | Critic Loss: {critic_loss.item():.4f} | Mean Reward: {mean_reward:.2f} | Best Mean Reward: {best_mean_reward:.2f} | Episodes: {trainer.completed_episodes}")
+        console.print(f"[Step {epoch}] Loss: {loss.item():.4f} | Actor Loss: {actor_loss.item():.4f} | Critic Loss: {critic_loss.item():.4f} | Mean Reward: {mean_reward:.4f} | Best Mean Reward: {best_mean_reward:.4f} | Episodes: {trainer.completed_episodes}")
     
-    torch.save(model.state_dict(), "pocp3.pth")
+    torch.save(model.state_dict(), "metta_simple.pth")
 
 def enjoy():
     env = gym.make("CartPole-v1", render_mode="human")
@@ -365,7 +403,7 @@ def enjoy():
 
     model = RLTransformerModel(
         action_dim=2,
-        num_layers=6,
+        num_layers=2,
         num_heads=8,
         d_model=256,
         ffn_size=256,
@@ -378,8 +416,6 @@ def enjoy():
 
     model.create_kv_cache(1, 512, device=device)
     obs, info = env.reset()
-    obs[..., 1] = 0.0
-    obs[..., 3] = 0.0
     obs_tensor = torch.from_numpy(obs).unsqueeze(0).to(device)
     positions = torch.zeros((1, 1), device=device, dtype=torch.int64)
 
@@ -388,16 +424,12 @@ def enjoy():
             action, log_prob, value = sample_action(model, obs_tensor, positions)
         np_action = action.squeeze().cpu().numpy()
         obs, reward, terminated, truncated, _ = env.step(np_action)
-        obs[..., 1] = terminated | truncated
-        obs[..., 3] = np_action / 2.0
 
         obs_tensor.copy_(torch.from_numpy(obs).unsqueeze(0))
         positions += 1
 
         if terminated or truncated:
             obs, info = env.reset()
-            obs[..., 1] = 0.0
-            obs[..., 3] = 0.0
             obs_tensor = torch.from_numpy(obs).unsqueeze(0).to(device)
             positions = torch.zeros((1, 1), device=device, dtype=torch.int64)
 
