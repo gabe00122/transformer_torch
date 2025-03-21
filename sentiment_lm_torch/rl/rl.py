@@ -3,7 +3,7 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from torch.distributions import Categorical, Distribution
 from torch.nn.attention.flex_attention import BlockMask
-from torchrl.objectives.value.functional import vec_generalized_advantage_estimate
+from torchrl.objectives.value.functional import generalized_advantage_estimate
 import gymnasium as gym
 from mettagrid.gym_wrapper import make, MultiToDiscreteWrapper
 
@@ -172,33 +172,37 @@ class RLTransformerModel(nn.Module):
         return policy, value
 
 
-@torch.compile(mode="max-autotune", disable=False)
-def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+@torch.compile(mode="max-autotune", disable=False, fullgraph=True)
+def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask, batch_idx: Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     vf_coef = 0.480
     entropy_coef = 0.00209
 
     vf_clip = 0.1
 
-    obs = rollout.obs
+    batch_obs = rollout.obs[batch_idx]
+    batch_target = rollout.target[batch_idx]
+    batch_log_prob = rollout.log_prob[batch_idx]
+    batch_actions = rollout.actions[batch_idx]
+    batch_advantage = rollout.advantage[batch_idx]
     # rollout_values = rollout.values[:, :-1]
 
-    positions = torch.arange(obs.size(1), device=torch.device("cuda"), dtype=torch.int64)[None, :]
+    positions = torch.arange(batch_obs.size(1), device=torch.device("cuda"), dtype=torch.int64)[None, :]
 
     # Observation dimensions: (batch_size, context_size, ...)
-    policy, values = model(obs, positions, block_mask=block_mask)
-    log_probs = policy.log_prob(rollout.actions)
+    policy, values = model(batch_obs, positions, block_mask=block_mask)
+    log_probs = policy.log_prob(batch_actions)
 
     # value_pred_clipped = rollout_values + (values - rollout_values).clamp(-vf_clip, vf_clip) 
 
-    value_losses = torch.square(values - rollout.target)
+    value_losses = torch.square(values - batch_target)
     # value_losses_clipped = torch.square(value_pred_clipped - rollout.target)
     # value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
     value_loss = 0.5 * value_losses.mean()
 
-    ratio = torch.exp(log_probs - rollout.log_prob)
+    ratio = torch.exp(log_probs - batch_log_prob)
 
-    loss_actor1 = ratio * rollout.advantage
-    loss_actor2 = torch.clamp(ratio, 1.0 - vf_clip, 1.0 + vf_clip) * rollout.advantage
+    loss_actor1 = ratio * batch_advantage
+    loss_actor2 = torch.clamp(ratio, 1.0 - vf_clip, 1.0 + vf_clip) * batch_advantage
 
     actor_loss = -torch.min(loss_actor1, loss_actor2).mean()
 
@@ -210,7 +214,7 @@ def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask
 
     return total_loss, actor_loss, value_loss
 
-@torch.compile(mode="reduce-overhead", dynamic=False, fullgraph=False)
+@torch.compile(mode="max-autotune", dynamic=False, fullgraph=True)
 def sample_action(model: RLTransformerModel, obs: Tensor, positions: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     policy, value = model(obs[:, None, ...], positions)
     action: Tensor = policy.sample()
@@ -239,10 +243,18 @@ class Rollout:
     def calculate_advantage(self):
         values = self.values[..., :-1]
         next_values = self.values[..., 1:]
-        self.advantage, self.target = vec_generalized_advantage_estimate(0.986, 0.818, values, next_values, self.reward, self.truncated | self.terminated, self.terminated, time_dim=1)
+        
+        # self.reward *= 100.0
+        
+        self.terminated[..., -1] = True
+        self.advantage, self.target = generalized_advantage_estimate(0.986, 0.818, values, next_values, self.reward, self.truncated | self.terminated, self.terminated, time_dim=1)
         
         # Normalize advantage
-        self.advantage = (self.advantage - self.advantage.mean()) / (self.advantage.std() + 1e-8)
+        # self.advantage = (self.advantage - self.advantage.mean()) / (self.advantage.std() + 1e-8)
+        if self.advantage.std() < 1e-7:
+            self.advantage = torch.zeros_like(self.advantage)
+        else:
+            self.advantage = (self.advantage - self.advantage.mean()) / (self.advantage.std() + 1e-8)
 
 
 class Trainer:
@@ -316,7 +328,7 @@ def train():
     torch.set_float32_matmul_precision('high')
     console = Console()
 
-    env = MultiToDiscreteWrapper(make("bases", overrides=["game.num_agents=28", "game.max_steps=256"]))
+    env = MultiToDiscreteWrapper(make("bases", overrides=["game.num_agents=28", "game.actions.change_color.enabled=false", "game.actions.swap.enabled=false", "game.actions.attack.enabled=false"]))
     image_shape = env.unwrapped.single_observation_space.shape
     action_dim = env.action_space.n
     num_agents = env.unwrapped.num_agents
@@ -327,7 +339,7 @@ def train():
     print(num_agents)
 
     batch_size = num_agents
-    trajectory_length = 512
+    trajectory_length = 256
     device = torch.device("cuda")
 
     d_model = 512
@@ -338,7 +350,7 @@ def train():
         channels=[32, 64],
         grid_features=env.unwrapped.grid_features
     )
-    policy_head = PolicyHead(d_model=d_model, action_dim=2)
+    policy_head = PolicyHead(d_model=d_model, action_dim=action_dim)
     value_head = ValueHead(d_model=d_model)
 
     model = RLTransformerModel(
@@ -363,31 +375,36 @@ def train():
     # console.print(f"Cnn Size: {abbreviate_number(get_param_count(model.layers))}")
     console.print(f"Model size: {abbreviate_number(get_param_count(model))} parameters")
     
-    total_steps = 100_000
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.00141)#, weight_decay=0.001, betas=(0.9, 0.9), eps=1e-12)
+    total_steps = 600 * 300
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.00141)#, weight_decay=0.001, betas=(0.9, 0.9), eps=1e-12)
     # scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=total_steps, start_factor=1.0, end_factor=0.0)
     model.to(device)
 
     trainer = Trainer(model, env, trajectory_length, device)
 
+    # batch_idx = torch.arange(trainer.batch_size, device=device, dtype=torch.int64)
+    minibatch_chunk = 2
+
     # Track cumulative rewards for monitoring
     best_mean_reward = 0.0
 
     for epoch in track(range(total_steps), console=console, disable=True):
-        optimizer.zero_grad()
-
-        if epoch % 3 == 0:
+        if epoch % 6 == 0:
             model.eval()
             rollout, mean_reward = trainer.create_rollout()
         
         # breakpoint()
+        perm = torch.randperm(trainer.batch_size, device=device)
+        perm_chunks = perm.chunk(minibatch_chunk)
 
-        model.train()
-        loss, actor_loss, critic_loss = loss_fn(model, rollout, trainer.block_mask)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-        optimizer.step()
-        # scheduler.step()
+        for chunk in perm_chunks:
+            optimizer.zero_grad()
+            model.train()
+            loss, actor_loss, critic_loss = loss_fn(model, rollout, trainer.block_mask, chunk)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            optimizer.step()
+            # scheduler.step()
         
         # Update best mean reward
         best_mean_reward = max(best_mean_reward, mean_reward)
