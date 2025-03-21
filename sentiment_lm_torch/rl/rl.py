@@ -172,15 +172,15 @@ class RLTransformerModel(nn.Module):
         return policy, value
 
 
-@torch.compile(mode="max-autotune", disable=True)
+@torch.compile(mode="max-autotune", disable=False)
 def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    vf_coef = 0.6
-    entropy_coef = 0.0 #0.00175
+    vf_coef = 0.480
+    entropy_coef = 0.00209
 
-    vf_clip = 0.2
+    vf_clip = 0.1
 
     obs = rollout.obs
-    rollout_values = rollout.values[:, :-1]
+    # rollout_values = rollout.values[:, :-1]
 
     positions = torch.arange(obs.size(1), device=torch.device("cuda"), dtype=torch.int64)[None, :]
 
@@ -188,11 +188,12 @@ def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask
     policy, values = model(obs, positions, block_mask=block_mask)
     log_probs = policy.log_prob(rollout.actions)
 
-    value_pred_clipped = rollout_values + (values - rollout_values).clamp(-vf_clip, vf_clip) 
+    # value_pred_clipped = rollout_values + (values - rollout_values).clamp(-vf_clip, vf_clip) 
 
     value_losses = torch.square(values - rollout.target)
-    value_losses_clipped = torch.square(value_pred_clipped - rollout.target)
-    value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
+    # value_losses_clipped = torch.square(value_pred_clipped - rollout.target)
+    # value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
+    value_loss = 0.5 * value_losses.mean()
 
     ratio = torch.exp(log_probs - rollout.log_prob)
 
@@ -206,11 +207,10 @@ def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask
     entropy_loss = -entropy.mean()
 
     total_loss = vf_coef * value_loss + actor_loss + entropy_coef * entropy_loss
-        # + entropy_coef * entropy_loss
 
     return total_loss, actor_loss, value_loss
 
-@torch.compile(mode="reduce-overhead", dynamic=False, fullgraph=True, disable=False)
+@torch.compile(mode="reduce-overhead", dynamic=False, fullgraph=False)
 def sample_action(model: RLTransformerModel, obs: Tensor, positions: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     policy, value = model(obs[:, None, ...], positions)
     action: Tensor = policy.sample()
@@ -237,9 +237,9 @@ class Rollout:
         self.target = torch.zeros((batch_size, trajectory_length), device=device, dtype=torch.float32)
     
     def calculate_advantage(self):
-        values = self.values[:, :-1]
-        next_values = self.values[:, 1:]
-        self.advantage, self.target = vec_generalized_advantage_estimate(0.95, 0.87, values, next_values, self.reward, self.truncated | self.terminated, self.terminated, time_dim=1)
+        values = self.values[..., :-1]
+        next_values = self.values[..., 1:]
+        self.advantage, self.target = vec_generalized_advantage_estimate(0.986, 0.818, values, next_values, self.reward, self.truncated | self.terminated, self.terminated, time_dim=1)
         
         # Normalize advantage
         self.advantage = (self.advantage - self.advantage.mean()) / (self.advantage.std() + 1e-8)
@@ -281,17 +281,17 @@ class Trainer:
         self.positions.zero_()
 
         obs, _ = self.env.reset()
-        self.obs_tensor.copy_(torch.from_numpy(obs))
+        self.obs_tensor.copy_(torch.from_numpy(obs), non_blocking=True)
 
-        for i in range(self.trajectory_length - 1):
+        for i in range(self.trajectory_length):
             with torch.no_grad():
                 action, log_prob, value = sample_action(self.model, self.obs_tensor, self.positions)
             np_action = action.cpu().numpy()
             obs, reward, terminated, truncated, _ = self.env.step(np_action)
             
-            self.reward_tensor.copy_(torch.from_numpy(reward))
-            self.terminated_tensor.copy_(torch.from_numpy(terminated))
-            self.truncated_tensor.copy_(torch.from_numpy(truncated))
+            self.reward_tensor.copy_(torch.from_numpy(reward), non_blocking=True)
+            self.terminated_tensor.copy_(torch.from_numpy(terminated), non_blocking=True)
+            self.truncated_tensor.copy_(torch.from_numpy(truncated), non_blocking=True)
 
             self.rollout.obs[:, i] = self.obs_tensor
             self.rollout.actions[:, i] = action
@@ -301,7 +301,7 @@ class Trainer:
             self.rollout.terminated[:, i] = self.terminated_tensor
             self.rollout.truncated[:, i] = self.truncated_tensor
             
-            self.obs_tensor.copy_(torch.from_numpy(obs))
+            self.obs_tensor.copy_(torch.from_numpy(obs), non_blocking=True)
             self.positions += 1
         
         with torch.no_grad():
@@ -312,12 +312,11 @@ class Trainer:
         return self.rollout, self.rollout.reward.sum()
 
 
-
 def train():
     torch.set_float32_matmul_precision('high')
     console = Console()
 
-    env = MultiToDiscreteWrapper(make("simple", overrides=["game.num_agents=60", "game.max_steps=512"]))
+    env = MultiToDiscreteWrapper(make("bases", overrides=["game.num_agents=28", "game.max_steps=256"]))
     image_shape = env.unwrapped.single_observation_space.shape
     action_dim = env.action_space.n
     num_agents = env.unwrapped.num_agents
@@ -358,14 +357,15 @@ def train():
     model.policy_head.linear.weight.data *= 0.01
     nn.init.orthogonal_(model.value_head.out_linear.weight)
 
-    model.create_kv_cache(batch_size, trajectory_length, device=device)
+    # +1 because we need to store the next trailing observation for the value head
+    model.create_kv_cache(batch_size, trajectory_length + 1, device=device)
 
     # console.print(f"Cnn Size: {abbreviate_number(get_param_count(model.layers))}")
     console.print(f"Model size: {abbreviate_number(get_param_count(model))} parameters")
     
-    total_steps = 1_000
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0007)#, weight_decay=0.001, betas=(0.9, 0.9), eps=1e-12)
-    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=total_steps, start_factor=1.0, end_factor=0.0)
+    total_steps = 100_000
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.00141)#, weight_decay=0.001, betas=(0.9, 0.9), eps=1e-12)
+    # scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=total_steps, start_factor=1.0, end_factor=0.0)
     model.to(device)
 
     trainer = Trainer(model, env, trajectory_length, device)
@@ -387,7 +387,7 @@ def train():
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         optimizer.step()
-        scheduler.step()
+        # scheduler.step()
         
         # Update best mean reward
         best_mean_reward = max(best_mean_reward, mean_reward)
