@@ -11,7 +11,7 @@ def apply_rope(inputs: Tensor, positions: Tensor, max_wavelength: int = _MAX_WAV
     head_dim = inputs.shape[-1]
 
     fraction = 2 * torch.arange(0, head_dim // 2, dtype=dtype, device=device) / head_dim
-    timescale = max_wavelength**fraction
+    timescale = (max_wavelength**fraction).to(dtype=dtype, device=device)
 
     sinusoid_inp = positions[..., None] / timescale[None, None, :]
     sinusoid_inp = sinusoid_inp[..., None, :]
