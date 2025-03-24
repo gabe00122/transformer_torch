@@ -6,6 +6,7 @@ from torch.nn.attention.flex_attention import BlockMask
 from torchrl.objectives.value.functional import vec_generalized_advantage_estimate
 import gymnasium as gym
 from mettagrid.gym_wrapper import make, MultiToDiscreteWrapper
+from typing import TypedDict, Optional, List, Tuple, Union
 
 from einops import rearrange
 
@@ -17,6 +18,50 @@ from sentiment_lm_torch.model.util import init_weights
 from sentiment_lm_torch.rl.metta_utils import ObservationNormalizer
 from sentiment_lm_torch.utils import get_param_count, abbreviate_number
 from sentiment_lm_torch.model.attention import causal_block_mask
+
+class RLConfig(TypedDict):
+    # Environment config
+    env_name: str
+    num_agents: int
+    max_steps: int
+    
+    # Training config
+    total_gradient_steps: int
+    trajectory_length: int
+    learning_rate: float
+    weight_decay: float
+    grad_clip: float
+    device: str
+    
+    # Model architecture config
+    d_model: int
+    num_layers: int
+    num_heads: int
+    ffn_size: int
+    activation: str  # 'relu', 'leaky_relu', 'silu'
+    use_glu: bool
+    
+    # CNN encoder config
+    cnn_channels: List[int]
+    grid_features: List[str]
+    
+    # Loss function config
+    vf_coef: float
+    entropy_coef: float
+    vf_clip: float
+    gamma: float
+    gae_lambda: float
+    
+    # Optimizer config
+    optimizer: str  # 'adam', 'adamw'
+    betas: Tuple[float, float]
+    eps: float
+    
+    # Optional scheduler config
+    use_scheduler: bool
+    scheduler_type: Optional[str]  # 'linear', 'cosine', etc.
+    scheduler_start_factor: float
+    scheduler_end_factor: float
 
 class MlpObservationEncoder(nn.Module):
     def __init__(self, obs_dim: int, d_model: int):
@@ -173,26 +218,19 @@ class RLTransformerModel(nn.Module):
 
 
 @torch.compile(mode="max-autotune", disable=False)
-def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    vf_coef = 0.480
-    entropy_coef = 0.00209
-
-    vf_clip = 0.1
+def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask, config: RLConfig) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    vf_coef = config["vf_coef"]
+    entropy_coef = config["entropy_coef"]
+    vf_clip = config["vf_clip"]
 
     obs = rollout.obs
-    # rollout_values = rollout.values[:, :-1]
-
     positions = torch.arange(obs.size(1), device=torch.device("cuda"), dtype=torch.int64)[None, :]
 
     # Observation dimensions: (batch_size, context_size, ...)
     policy, values = model(obs, positions, block_mask=block_mask)
     log_probs = policy.log_prob(rollout.actions)
 
-    # value_pred_clipped = rollout_values + (values - rollout_values).clamp(-vf_clip, vf_clip) 
-
     value_losses = torch.square(values - rollout.target)
-    # value_losses_clipped = torch.square(value_pred_clipped - rollout.target)
-    # value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
     value_loss = 0.5 * value_losses.mean()
 
     ratio = torch.exp(log_probs - rollout.log_prob)
@@ -236,10 +274,19 @@ class Rollout:
         self.advantage = torch.zeros((batch_size, trajectory_length), device=device, dtype=torch.float32)
         self.target = torch.zeros((batch_size, trajectory_length), device=device, dtype=torch.float32)
     
-    def calculate_advantage(self):
+    def calculate_advantage(self, config: RLConfig):
         values = self.values[..., :-1]
         next_values = self.values[..., 1:]
-        self.advantage, self.target = vec_generalized_advantage_estimate(0.986, 0.818, values, next_values, self.reward, self.truncated | self.terminated, self.terminated, time_dim=1)
+        self.advantage, self.target = vec_generalized_advantage_estimate(
+            config["gamma"],
+            config["gae_lambda"],
+            values,
+            next_values,
+            self.reward,
+            self.truncated | self.terminated,
+            self.terminated,
+            time_dim=1
+        )
         
         # Normalize advantage
         self.advantage = (self.advantage - self.advantage.mean()) / (self.advantage.std() + 1e-8)
@@ -308,46 +355,54 @@ class Trainer:
             _, _, value = sample_action(self.model, self.obs_tensor, self.positions)
         self.rollout.values[:, -1] = value
 
-        self.rollout.calculate_advantage()
+        self.rollout.calculate_advantage(config)
         return self.rollout, self.rollout.reward.sum()
 
 
-def train():
+def train(config: RLConfig):
     torch.set_float32_matmul_precision('high')
     console = Console()
 
-    env = MultiToDiscreteWrapper(make("bases", overrides=["game.num_agents=28", "game.max_steps=256"]))
+    env = MultiToDiscreteWrapper(make(config["env_name"], overrides=[
+        f"game.num_agents={config['num_agents']}", 
+        f"game.max_steps={config['max_steps']}"
+    ]))
     image_shape = env.unwrapped.single_observation_space.shape
     action_dim = env.action_space.n
     num_agents = env.unwrapped.num_agents
 
-    # image_shape = (image_shape[1], image_shape[2], image_shape[0])
     print(image_shape)
     print(action_dim)
     print(num_agents)
 
     batch_size = num_agents
-    trajectory_length = 512
-    device = torch.device("cuda")
+    device = torch.device(config["device"])
 
-    d_model = 512
+    # Create activation function based on config
+    activation_map = {
+        "relu": nn.ReLU(),
+        "leaky_relu": nn.LeakyReLU(),
+        "silu": nn.SiLU()
+    }
+    activation = activation_map[config["activation"]]
+
     observation_encoder = MetaCnnEncoder(
         img_shape=image_shape,
-        d_model=d_model,
-        activation=nn.LeakyReLU(),
-        channels=[32, 64],
-        grid_features=env.unwrapped.grid_features
+        d_model=config["d_model"],
+        activation=activation,
+        channels=config["cnn_channels"],
+        grid_features=config["grid_features"]
     )
-    policy_head = PolicyHead(d_model=d_model, action_dim=2)
-    value_head = ValueHead(d_model=d_model)
+    policy_head = PolicyHead(d_model=config["d_model"], action_dim=2)
+    value_head = ValueHead(d_model=config["d_model"])
 
     model = RLTransformerModel(
-        num_layers=2,
-        num_heads=8,
-        d_model=d_model,
-        ffn_size=d_model,
-        activation=nn.LeakyReLU(),
-        glu=False,
+        num_layers=config["num_layers"],
+        num_heads=config["num_heads"],
+        d_model=config["d_model"],
+        ffn_size=config["ffn_size"],
+        activation=activation,
+        glu=config["use_glu"],
         observation_encoder=observation_encoder,
         policy_head=policy_head,
         value_head=value_head,
@@ -357,37 +412,60 @@ def train():
     model.policy_head.linear.weight.data *= 0.01
     nn.init.orthogonal_(model.value_head.out_linear.weight)
 
-    # +1 because we need to store the next trailing observation for the value head
-    model.create_kv_cache(batch_size, trajectory_length + 1, device=device)
+    model.create_kv_cache(batch_size, config["trajectory_length"] + 1, device=device)
 
-    # console.print(f"Cnn Size: {abbreviate_number(get_param_count(model.layers))}")
     console.print(f"Model size: {abbreviate_number(get_param_count(model))} parameters")
     
-    total_steps = 100_000
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.00141)#, weight_decay=0.001, betas=(0.9, 0.9), eps=1e-12)
-    # scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=total_steps, start_factor=1.0, end_factor=0.0)
+    # Create optimizer based on config
+    if config["optimizer"] == "adam":
+        optimizer = torch.optim.Adam(
+            model.parameters(), 
+            lr=config["learning_rate"],
+            weight_decay=config["weight_decay"],
+            betas=config["betas"],
+            eps=config["eps"]
+        )
+    else:  # adamw
+        optimizer = torch.optim.AdamW(
+            model.parameters(), 
+            lr=config["learning_rate"],
+            weight_decay=config["weight_decay"],
+            betas=config["betas"],
+            eps=config["eps"]
+        )
+
+    # Create scheduler if configured
+    scheduler = None
+    if config["use_scheduler"]:
+        if config["scheduler_type"] == "linear":
+            scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                total_iters=config["total_gradient_steps"],
+                start_factor=config["scheduler_start_factor"],
+                end_factor=config["scheduler_end_factor"]
+            )
+
     model.to(device)
 
-    trainer = Trainer(model, env, trajectory_length, device)
+    trainer = Trainer(model, env, config["trajectory_length"], device)
 
     # Track cumulative rewards for monitoring
     best_mean_reward = 0.0
 
-    for epoch in track(range(total_steps), console=console, disable=True):
+    for epoch in track(range(config["total_gradient_steps"]), console=console, disable=True):
         optimizer.zero_grad()
 
         if epoch % 3 == 0:
             model.eval()
             rollout, mean_reward = trainer.create_rollout()
         
-        # breakpoint()
-
         model.train()
-        loss, actor_loss, critic_loss = loss_fn(model, rollout, trainer.block_mask)
+        loss, actor_loss, critic_loss = loss_fn(model, rollout, trainer.block_mask, config)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
         optimizer.step()
-        # scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
         
         # Update best mean reward
         best_mean_reward = max(best_mean_reward, mean_reward)
@@ -435,4 +513,36 @@ def enjoy():
 
 
 if __name__ == "__main__":
-    train()
+    # Example configuration
+    config: RLConfig = {
+        "env_name": "bases",
+        "num_agents": 28,
+        "max_steps": 256,
+        "total_gradient_steps": 100_000,
+        "trajectory_length": 512,
+        "learning_rate": 0.00141,
+        "weight_decay": 0.001,
+        "grad_clip": 0.5,
+        "device": "cuda",
+        "d_model": 512,
+        "num_layers": 2,
+        "num_heads": 8,
+        "ffn_size": 512,
+        "activation": "leaky_relu",
+        "use_glu": False,
+        "cnn_channels": [32, 64],
+        "grid_features": [],
+        "vf_coef": 0.480,
+        "entropy_coef": 0.00209,
+        "vf_clip": 0.1,
+        "gamma": 0.986,
+        "gae_lambda": 0.818,
+        "optimizer": "adamw",
+        "betas": (0.9, 0.9),
+        "eps": 1e-12,
+        "use_scheduler": False,
+        "scheduler_type": None,
+        "scheduler_start_factor": 1.0,
+        "scheduler_end_factor": 0.0
+    }
+    train(config)
