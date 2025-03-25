@@ -566,5 +566,3 @@ def objective(trial_id: int, trial: optuna.Trial):
 if __name__ == "__main__":
     study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(n_startup_trials=20, multivariate=True, group=True))
     study.optimize(lambda trial: objective(trial.number, trial), n_trials=200)
-
-    train(0, config)
