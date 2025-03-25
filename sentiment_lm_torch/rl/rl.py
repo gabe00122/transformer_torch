@@ -4,6 +4,7 @@ from torch.nn import functional as F
 from torch.distributions import Categorical, Distribution
 from torch.nn.attention.flex_attention import BlockMask
 from torchrl.objectives.value.functional import vec_generalized_advantage_estimate
+import numpy as np
 import gymnasium as gym
 from mettagrid.gym_wrapper import make, MultiToDiscreteWrapper
 from typing import TypedDict, Optional, List, Tuple, Union
@@ -27,6 +28,7 @@ class RLConfig(TypedDict):
     
     # Training config
     total_gradient_steps: int
+    minibatch_steps: int
     trajectory_length: int
     learning_rate: float
     weight_decay: float
@@ -43,7 +45,6 @@ class RLConfig(TypedDict):
     
     # CNN encoder config
     cnn_channels: List[int]
-    grid_features: List[str]
     
     # Loss function config
     vf_coef: float
@@ -224,6 +225,9 @@ def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask
     vf_clip = config["vf_clip"]
 
     obs = rollout.obs
+    advantage = rollout.advantage
+    advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+
     positions = torch.arange(obs.size(1), device=torch.device("cuda"), dtype=torch.int64)[None, :]
 
     # Observation dimensions: (batch_size, context_size, ...)
@@ -235,8 +239,8 @@ def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask
 
     ratio = torch.exp(log_probs - rollout.log_prob)
 
-    loss_actor1 = ratio * rollout.advantage
-    loss_actor2 = torch.clamp(ratio, 1.0 - vf_clip, 1.0 + vf_clip) * rollout.advantage
+    loss_actor1 = ratio * advantage
+    loss_actor2 = torch.clamp(ratio, 1.0 - vf_clip, 1.0 + vf_clip) * advantage
 
     actor_loss = -torch.min(loss_actor1, loss_actor2).mean()
 
@@ -277,6 +281,10 @@ class Rollout:
     def calculate_advantage(self, config: RLConfig):
         values = self.values[..., :-1]
         next_values = self.values[..., 1:]
+
+        # Sets the last value to be terminated because the end of the trajectory is always out of distribution for the transformer.
+        self.terminated[..., -1] = True
+
         self.advantage, self.target = vec_generalized_advantage_estimate(
             config["gamma"],
             config["gae_lambda"],
@@ -287,9 +295,6 @@ class Rollout:
             self.terminated,
             time_dim=1
         )
-        
-        # Normalize advantage
-        self.advantage = (self.advantage - self.advantage.mean()) / (self.advantage.std() + 1e-8)
 
 
 class Trainer:
@@ -359,13 +364,13 @@ class Trainer:
         return self.rollout, self.rollout.reward.sum()
 
 
-def train(config: RLConfig):
+def train(trial_id: int, config: RLConfig):
     torch.set_float32_matmul_precision('high')
     console = Console()
 
     env = MultiToDiscreteWrapper(make(config["env_name"], overrides=[
         f"game.num_agents={config['num_agents']}", 
-        f"game.max_steps={config['max_steps']}"
+        # f"game.max_steps={config['max_steps']}"
     ]))
     image_shape = env.unwrapped.single_observation_space.shape
     action_dim = env.action_space.n
@@ -391,7 +396,7 @@ def train(config: RLConfig):
         d_model=config["d_model"],
         activation=activation,
         channels=config["cnn_channels"],
-        grid_features=config["grid_features"]
+        grid_features=env.unwrapped.grid_features
     )
     policy_head = PolicyHead(d_model=config["d_model"], action_dim=2)
     value_head = ValueHead(d_model=config["d_model"])
@@ -449,16 +454,20 @@ def train(config: RLConfig):
 
     trainer = Trainer(model, env, config["trajectory_length"], device)
 
+    total_rollouts = config["total_gradient_steps"] // config["minibatch_steps"]
+    objective = 0.0
+
     # Track cumulative rewards for monitoring
     best_mean_reward = 0.0
 
     for epoch in track(range(config["total_gradient_steps"]), console=console, disable=True):
         optimizer.zero_grad()
 
-        if epoch % 3 == 0:
+        if epoch % config["minibatch_steps"] == 0:
             model.eval()
             rollout, mean_reward = trainer.create_rollout()
-        
+            objective += mean_reward.item() / total_rollouts
+
         model.train()
         loss, actor_loss, critic_loss = loss_fn(model, rollout, trainer.block_mask, config)
         loss.backward()
@@ -473,7 +482,9 @@ def train(config: RLConfig):
         # Log metrics
         console.print(f"[Step {epoch}] Loss: {loss.item():.4f} | Actor Loss: {actor_loss.item():.4f} | Critic Loss: {critic_loss.item():.4f} | Mean Reward: {mean_reward:.4f} | Best Mean Reward: {best_mean_reward:.4f} | Episodes: {trainer.completed_episodes}")
     
-    torch.save(model.state_dict(), "metta_simple.pth")
+    torch.save(model.state_dict(), f"trial_{trial_id}.pth")
+    return objective
+
 
 def enjoy():
     env = gym.make("CartPole-v1", render_mode="human")
@@ -511,38 +522,49 @@ def enjoy():
             obs_tensor = torch.from_numpy(obs).unsqueeze(0).to(device)
             positions = torch.zeros((1, 1), device=device, dtype=torch.int64)
 
+import optuna
 
-if __name__ == "__main__":
-    # Example configuration
+def objective(trial_id: int, trial: optuna.Trial):
     config: RLConfig = {
         "env_name": "bases",
         "num_agents": 28,
         "max_steps": 256,
-        "total_gradient_steps": 100_000,
-        "trajectory_length": 512,
-        "learning_rate": 0.00141,
-        "weight_decay": 0.001,
-        "grad_clip": 0.5,
+        "total_gradient_steps": 10_000,
+        "minibatch_steps": 3,
+        "trajectory_length": 256,
+        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
+        "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
+        "grad_clip": trial.suggest_float("grad_clip", 0.05, 1.0, step=0.05),
+        "vf_coef": trial.suggest_float("vf_coef", 0.1, 2.0),
+        "entropy_coef": trial.suggest_float("entropy_coef", 0.0001, 0.1, log=True),
+        "vf_clip": trial.suggest_float("vf_clip", 0.05, 0.5),
+        "gamma": trial.suggest_float("gamma", 0.95, 0.999),
+        "gae_lambda": trial.suggest_float("gae_lambda", 0.8, 0.99),
+        "betas": (
+            trial.suggest_float("beta1", 0.8, 0.999), 
+            trial.suggest_float("beta2", 0.9, 0.9999)
+        ),
         "device": "cuda",
-        "d_model": 512,
+        "d_model": 256,
         "num_layers": 2,
         "num_heads": 8,
         "ffn_size": 512,
-        "activation": "leaky_relu",
+        "activation": "silu",
         "use_glu": False,
         "cnn_channels": [32, 64],
-        "grid_features": [],
-        "vf_coef": 0.480,
-        "entropy_coef": 0.00209,
-        "vf_clip": 0.1,
-        "gamma": 0.986,
-        "gae_lambda": 0.818,
         "optimizer": "adamw",
-        "betas": (0.9, 0.9),
         "eps": 1e-12,
         "use_scheduler": False,
         "scheduler_type": None,
         "scheduler_start_factor": 1.0,
         "scheduler_end_factor": 0.0
     }
-    train(config)
+
+    outcome = train(trial_id, config)
+    return outcome
+
+if __name__ == "__main__":
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(n_startup_trials=20, multivariate=True, group=True))
+    study.optimize(lambda trial: objective(trial.number, trial), n_trials=200)
+
+    train(0, config)
