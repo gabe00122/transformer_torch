@@ -17,7 +17,6 @@ import wandb
 from sentiment_lm_torch.constants import SPECIAL_TOKENS
 from sentiment_lm_torch.dataset import SentimentDataset
 from sentiment_lm_torch.model.attention import causal_block_mask
-from sentiment_lm_torch.model.positional_embeddings import create_rope_cache
 from sentiment_lm_torch.model.util import init_weights
 from sentiment_lm_torch.scheduler import get_cosine_schedule_with_warmup
 from sentiment_lm_torch.utils import get_param_count, abbreviate_number
@@ -55,22 +54,19 @@ def train(cfg: DictConfig) -> None:
     console.print(f"Parameter count: {abbreviate_number(get_param_count(model))}")
 
     model = model.to(device)    
-    train_step_compiled = train_step #torch.compile(train_step, fullgraph=True)
-    if True:
-        train_step_compiled = torch.compile(train_step, fullgraph=True, mode="max-autotune-no-cudagraphs", dynamic=False)
+    train_step_compiled = torch.compile(train_step, mode="max-autotune-no-cudagraphs", fullgraph=True, dynamic=False, disable=False)
 
     # wandb.init(project="sentiment_lm_torch")
 
     loss_metric = 0
 
-    rope_cache = create_rope_cache(cfg.model.d_model // cfg.model.num_heads, torch.arange(context_size))
     block_mask = causal_block_mask(context_size)
 
     model.train()
     for step, tokens in track(enumerate(ncycles(training_dataloader, cfg.epochs)), total=total_steps, console=console):
         tokens = tokens.to(device)
         
-        loss = train_step_compiled(model, tokens, cfg.accumulation_steps, rope_cache, block_mask)
+        loss = train_step_compiled(model, tokens, cfg.accumulation_steps, block_mask)
         loss.backward()
 
         loss_metric += loss.item()
@@ -95,13 +91,13 @@ def loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(logits, targets, ignore_index=EMPTY_TOKEN)
 
 
-def train_step(model, tokens, accumulation_steps,  rope_cache: tuple[Tensor, Tensor], block_mask: BlockMask):
+def train_step(model, tokens, accumulation_steps, block_mask: BlockMask):
     input_tokens = tokens[:, :-1]
     labels = tokens[:, 1:]
 
     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
         # todo: join the rope_cache and block_mask into a object for convenience
-        logits = model(input_tokens, rope_cache, block_mask)
+        logits = model(input_tokens, torch.arange(input_tokens.size(1), dtype=torch.int64, device=input_tokens.device), block_mask)
         return loss_fn(logits, labels) / accumulation_steps
 
 
