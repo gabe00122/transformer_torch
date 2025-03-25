@@ -172,7 +172,7 @@ class RLTransformerModel(nn.Module):
         return policy, value
 
 
-@torch.compile(mode="max-autotune", disable=False, fullgraph=True)
+@torch.compile(mode="max-autotune", fullgraph=True, disable=False)
 def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask, batch_idx: Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     vf_coef = 0.480
     entropy_coef = 0.00209
@@ -184,7 +184,7 @@ def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask
     batch_log_prob = rollout.log_prob[batch_idx]
     batch_actions = rollout.actions[batch_idx]
     batch_advantage = rollout.advantage[batch_idx]
-    # rollout_values = rollout.values[:, :-1]
+    rollout_values = rollout.values[batch_idx, :-1]
 
     positions = torch.arange(batch_obs.size(1), device=torch.device("cuda"), dtype=torch.int64)[None, :]
 
@@ -192,12 +192,12 @@ def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask
     policy, values = model(batch_obs, positions, block_mask=block_mask)
     log_probs = policy.log_prob(batch_actions)
 
-    # value_pred_clipped = rollout_values + (values - rollout_values).clamp(-vf_clip, vf_clip) 
+    value_pred_clipped = rollout_values + (values - rollout_values).clamp(-vf_clip, vf_clip) 
 
     value_losses = torch.square(values - batch_target)
-    # value_losses_clipped = torch.square(value_pred_clipped - rollout.target)
-    # value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
-    value_loss = 0.5 * value_losses.mean()
+    value_losses_clipped = torch.square(value_pred_clipped - batch_target)
+    value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
+    # value_loss = 0.5 * value_losses.mean()
 
     ratio = torch.exp(log_probs - batch_log_prob)
 
@@ -389,7 +389,7 @@ def train():
     best_mean_reward = 0.0
 
     for epoch in track(range(total_steps), console=console, disable=True):
-        if epoch % 6 == 0:
+        if epoch % 3 == 0:
             model.eval()
             rollout, mean_reward = trainer.create_rollout()
         
