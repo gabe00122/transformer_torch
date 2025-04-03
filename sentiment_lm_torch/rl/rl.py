@@ -118,32 +118,29 @@ class MetaCnnEncoder(nn.Module):
 
 
 class PolicyHead(nn.Module):
-    def __init__(self, d_model: int, action_dim: int):
+    def __init__(self, d_model: int, action_dim: int, activation: nn.Module = nn.LeakyReLU()):
         super().__init__()
-        self.d_model = d_model
-        self.action_dim = action_dim
-        self.p_linear = nn.Linear(d_model, d_model)
-        self.linear = nn.Linear(d_model, self.action_dim)
+        self.in_linear = nn.Linear(d_model, d_model)
+        self.activation = activation
+        self.out_linear = nn.Linear(d_model, action_dim)
 
     def forward(self, x: torch.Tensor) -> Distribution:
-        x = self.p_linear(x)
-        x = F.leaky_relu(x)
-        x = self.linear(x)
+        x = self.in_linear(x)
+        x = self.activation(x)
+        x = self.out_linear(x)
         
         return Categorical(logits=x)
 
 
 class ValueHead(nn.Module):
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, activation: nn.Module = nn.LeakyReLU()):
         super().__init__()
-        self.d_model = d_model
-
-        self.p_linear = nn.Linear(d_model, d_model)
-        self.activation = nn.LeakyReLU()
+        self.in_linear = nn.Linear(d_model, d_model)
+        self.activation = activation
         self.out_linear = nn.Linear(d_model, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.p_linear(x)
+        x = self.in_linear(x)
         x = self.activation(x)
         x = self.out_linear(x)
         return x
@@ -420,8 +417,8 @@ def train(trial_id: int, config: RLConfig):
         value_head=value_head,
     )
     model.apply(init_weights)
-    nn.init.orthogonal_(model.policy_head.linear.weight)
-    model.policy_head.linear.weight.data *= 0.01
+    nn.init.orthogonal_(model.policy_head.out_linear.weight)
+    model.policy_head.out_linear.weight.data *= 0.01
     nn.init.orthogonal_(model.value_head.out_linear.weight)
 
     model.create_kv_cache(batch_size, config["trajectory_length"] + 1, device=device)
@@ -433,7 +430,6 @@ def train(trial_id: int, config: RLConfig):
         optimizer = torch.optim.Adam(
             model.parameters(), 
             lr=config["learning_rate"],
-            weight_decay=config["weight_decay"],
             betas=config["betas"],
             eps=config["eps"]
         )
@@ -475,7 +471,6 @@ def train(trial_id: int, config: RLConfig):
             rollout, mean_reward = trainer.create_rollout(config)
             objective += mean_reward / total_rollouts
         
-        # breakpoint()
         perm = torch.randperm(trainer.batch_size, device=device)
         perm_chunks = perm.chunk(minibatch_chunk)
 
@@ -487,6 +482,9 @@ def train(trial_id: int, config: RLConfig):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
         
+        if scheduler is not None:
+            scheduler.step()
+        
         # Update best mean reward
         best_mean_reward = max(best_mean_reward, mean_reward)
         
@@ -497,41 +495,97 @@ def train(trial_id: int, config: RLConfig):
     return objective
 
 
-def enjoy():
-    env = gym.make("CartPole-v1", render_mode="human")
-    device = torch.device("cuda")
+def enjoy(trial_id: int, config: RLConfig):
+    env = MultiToDiscreteWrapper(make(config["env_name"], render_mode="human", overrides=[
+        "game.num_agents=24",
+        "game.actions.change_color.enabled=false",
+        "game.actions.swap.enabled=false",
+        "game.actions.attack.enabled=false",
+    ]))
+    image_shape = env.unwrapped.single_observation_space.shape
+    action_dim = env.action_space.n
+    num_agents = env.unwrapped.num_agents
+
+    device = torch.device(config["device"])
+
+        # Create activation function based on config
+    activation_map = {
+        "relu": nn.ReLU(),
+        "leaky_relu": nn.LeakyReLU(),
+        "silu": nn.SiLU()
+    }
+    activation = activation_map[config["activation"]]
+
+    observation_encoder = MetaCnnEncoder(
+        img_shape=image_shape,
+        d_model=config["d_model"],
+        activation=activation,
+        channels=config["cnn_channels"],
+        grid_features=env.unwrapped.grid_features
+    )
+    policy_head = PolicyHead(d_model=config["d_model"], action_dim=action_dim)
+    value_head = ValueHead(d_model=config["d_model"])
 
     model = RLTransformerModel(
-        action_dim=2,
-        num_layers=2,
-        num_heads=8,
-        d_model=256,
-        ffn_size=256,
-        activation=nn.LeakyReLU(),
-        glu=False,
+        num_layers=config["num_layers"],
+        num_heads=config["num_heads"],
+        d_model=config["d_model"],
+        ffn_size=config["ffn_size"],
+        activation=activation,
+        glu=config["use_glu"],
+        observation_encoder=observation_encoder,
+        policy_head=policy_head,
+        value_head=value_head,
     )
-    model.load_state_dict(torch.load("pocp2.pth"))
+    model.to(memory_format=torch.channels_last)
+
+    model_state_dict: dict = torch.load(f"checkpoints/trial_{trial_id}.pth")
+    model_state_dict["policy_head.in_linear.weight"] = model_state_dict["policy_head.p_linear.weight"]
+    model_state_dict["policy_head.out_linear.weight"] = model_state_dict["policy_head.linear.weight"]
+    model_state_dict["value_head.in_linear.weight"] = model_state_dict["value_head.p_linear.weight"]
+    model_state_dict["policy_head.in_linear.bias"] = model_state_dict["policy_head.p_linear.bias"]
+    model_state_dict["policy_head.out_linear.bias"] = model_state_dict["policy_head.linear.bias"]
+    model_state_dict["value_head.in_linear.bias"] = model_state_dict["value_head.p_linear.bias"]
+
+    del model_state_dict["policy_head.p_linear.weight"]
+    del model_state_dict["policy_head.linear.weight"]
+    del model_state_dict["value_head.p_linear.weight"]
+    del model_state_dict["policy_head.p_linear.bias"]
+    del model_state_dict["policy_head.linear.bias"]
+    del model_state_dict["value_head.p_linear.bias"]
+
+    model.load_state_dict(model_state_dict)
     model.to(device)
+    model.create_kv_cache(num_agents, config["trajectory_length"] + 1, device=device)
+
     model.eval()
 
-    model.create_kv_cache(1, 512, device=device)
-    obs, info = env.reset()
-    obs_tensor = torch.from_numpy(obs).unsqueeze(0).to(device)
-    positions = torch.zeros((1, 1), device=device, dtype=torch.int64)
+    while True:
+        positions = torch.zeros((num_agents, 1), device=device, dtype=torch.int64)
 
-    for _ in range(10000):
-        with torch.no_grad():
-            action, log_prob, value = sample_action(model, obs_tensor, positions)
-        np_action = action.squeeze().cpu().numpy()
-        obs, reward, terminated, truncated, _ = env.step(np_action)
+        obs, _ = env.reset()
+        for i in range(config["trajectory_length"]):
+            with torch.no_grad():
+                action, _, _ = sample_action(model, torch.from_numpy(obs).to(device), positions)
+            obs, _, _, _, _ = env.step(action.cpu().numpy())
+            positions += 1
 
-        obs_tensor.copy_(torch.from_numpy(obs).unsqueeze(0))
-        positions += 1
 
-        if terminated or truncated:
-            obs, info = env.reset()
-            obs_tensor = torch.from_numpy(obs).unsqueeze(0).to(device)
-            positions = torch.zeros((1, 1), device=device, dtype=torch.int64)
+def rand_enjoy(trial_id: int, config: RLConfig):
+    env = MultiToDiscreteWrapper(make(config["env_name"], render_mode="human", overrides=[
+        "game.num_agents=28",
+        "game.actions.change_color.enabled=false",
+        "game.actions.swap.enabled=false",
+        "game.actions.attack.enabled=false",
+    ]))
+    action_dim = env.action_space.n
+    num_agents = env.unwrapped.num_agents
+
+    while True:
+        env.reset()
+        for i in range(config["trajectory_length"]):
+            action = np.random.randint(0, action_dim, size=(num_agents,))
+            env.step(action)
 
 import optuna
 
@@ -540,20 +594,20 @@ def objective(trial: optuna.Trial):
         "env_name": "bases",
         "num_agents": 28,
         "max_steps": 256,
-        "total_gradient_steps": 10_000,
+        "total_gradient_steps": 50_000 * 12,
         "minibatch_steps": 3,
         "trajectory_length": 256,
-        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
-        "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
-        "grad_clip": trial.suggest_float("grad_clip", 0.05, 1.0, step=0.05),
-        "vf_coef": trial.suggest_float("vf_coef", 0.1, 2.0),
-        "entropy_coef": trial.suggest_float("entropy_coef", 0.0001, 0.1, log=True),
-        "vf_clip": trial.suggest_float("vf_clip", 0.05, 0.5),
-        "gamma": trial.suggest_float("gamma", 0.95, 0.999),
-        "gae_lambda": trial.suggest_float("gae_lambda", 0.8, 0.99),
+        "learning_rate": 0.00012189571664289048,#trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
+        "weight_decay": 2.8231209643433947e-06, #trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
+        "grad_clip": 0.5, #trial.suggest_float("grad_clip", 0.05, 1.0, step=0.05),
+        "vf_coef": 2.0, #trial.suggest_float("vf_coef", 0.1, 2.0),
+        "entropy_coef": 0.0000, #trial.suggest_float("entropy_coef", 0.0001, 0.1, log=True),
+        "vf_clip": 0.05, #trial.suggest_float("vf_clip", 0.05, 0.5),
+        "gamma": 0.9778341518401994, #trial.suggest_float("gamma", 0.95, 0.999),
+        "gae_lambda": 0.8709159722118665, #trial.suggest_float("gae_lambda", 0.8, 0.99),
         "betas": (
-            trial.suggest_float("beta1", 0.8, 0.999), 
-            trial.suggest_float("beta2", 0.9, 0.9999)
+            0.9678260586674491,#trial.suggest_float("beta1", 0.8, 0.999), 
+            0.9999, #trial.suggest_float("beta2", 0.9, 0.9999)
         ),
         "device": "cuda",
         "d_model": 256,
@@ -563,24 +617,26 @@ def objective(trial: optuna.Trial):
         "activation": "silu",
         "use_glu": False,
         "cnn_channels": [32, 64],
-        "optimizer": "adamw",
+        "optimizer": "adam",
         "eps": 1e-12,
-        "use_scheduler": False,
-        "scheduler_type": None,
+        "use_scheduler": True,
+        "scheduler_type": "linear",
         "scheduler_start_factor": 1.0,
         "scheduler_end_factor": 0.0
     }
 
-    torch.compiler.reset()
-    outcome = train(trial.number, config)
-    return outcome
+    # torch.compiler.reset()
+    enjoy(3, config)
+    # outcome = train(3, config)
+    # return outcome
 
 if __name__ == "__main__":
-    study_name = "sentiment_lm_torch_rl"
-    storage_name = f"sqlite:///{study_name}.db"
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(n_startup_trials=20, multivariate=True, group=True),
-        storage=storage_name,
-    )
-    study.optimize(objective, n_trials=200)
+    # study_name = "sentiment_lm_torch_rl"
+    # storage_name = f"sqlite:///{study_name}.db"
+    # study = optuna.create_study(
+    #     direction="maximize",
+    #     sampler=optuna.samplers.TPESampler(n_startup_trials=20, multivariate=True, group=True),
+    #     storage=storage_name,
+    # )
+    # study.optimize(objective, n_trials=200)
+    objective(None)
