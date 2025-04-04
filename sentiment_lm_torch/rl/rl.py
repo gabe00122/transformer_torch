@@ -20,11 +20,20 @@ from sentiment_lm_torch.rl.metta_utils import ObservationNormalizer
 from sentiment_lm_torch.utils import get_param_count, abbreviate_number
 from sentiment_lm_torch.model.attention import causal_block_mask
 
+import wandb
+
+wandb.login()
+
+run = wandb.init(
+    project="transformer-rl",
+    name="metta-transformer-rl-2",
+)
+
+
 class RLConfig(TypedDict):
     # Environment config
     env_name: str
     num_agents: int
-    max_steps: int
     
     # Training config
     total_gradient_steps: int
@@ -84,7 +93,7 @@ class MetaCnnEncoder(nn.Module):
         img_shape: tuple[int, ...],
         d_model: int,
         activation: nn.Module,
-        channels=[32, 64],
+        channels=[64, 256],
         *,
         grid_features: list[str] = [],
     ):
@@ -97,7 +106,7 @@ class MetaCnnEncoder(nn.Module):
         self.conv2 = nn.Conv2d(channels[0], channels[1], kernel_size=3, stride=1)
         img_shape = _convolution_shape(img_shape, 3, 1)
         
-        self.linear = nn.Linear(img_shape[0] * img_shape[1] * channels[1], d_model)
+        # self.linear = nn.Linear(img_shape[0] * img_shape[1] * channels[1], d_model)
         self.activation = activation
 
         self.object_normalizer = ObservationNormalizer(grid_features)
@@ -112,7 +121,7 @@ class MetaCnnEncoder(nn.Module):
         x = self.activation(self.conv1(obs))
         x = self.activation(self.conv2(x))
         x = rearrange(x, "(b l) c h w -> b l (h w c)", b=b, l=l)
-        x = self.linear(x)
+        # x = self.linear(x)
 
         return x
 
@@ -256,9 +265,9 @@ def loss_fn(model: RLTransformerModel, rollout: 'Rollout', block_mask: BlockMask
 
     total_loss = vf_coef * value_loss + actor_loss + entropy_coef * entropy_loss
 
-    return total_loss, actor_loss, value_loss
+    return total_loss, actor_loss, value_loss, entropy_loss
 
-@torch.compile(mode="max-autotune", dynamic=False, fullgraph=True)
+@torch.compile(mode="max-autotune", dynamic=False, fullgraph=True, disable=False)
 def sample_action(model: RLTransformerModel, obs: Tensor, positions: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     policy, value = model(obs[:, None, ...], positions)
     action: Tensor = policy.sample()
@@ -374,7 +383,7 @@ def train(trial_id: int, config: RLConfig):
     torch.set_float32_matmul_precision('high')
     console = Console()
 
-    env = MultiToDiscreteWrapper(make(config["env_name"], overrides=["game.num_agents=28", "game.actions.change_color.enabled=false", "game.actions.swap.enabled=false", "game.actions.attack.enabled=false"]))
+    env = MultiToDiscreteWrapper(make(config["env_name"], overrides=["game.num_agents=24", "game.actions.change_color.enabled=false", "game.actions.swap.enabled=false", "game.actions.attack.enabled=false"]))
     image_shape = env.unwrapped.single_observation_space.shape
     action_dim = env.action_space.n
     num_agents = env.unwrapped.num_agents
@@ -477,7 +486,7 @@ def train(trial_id: int, config: RLConfig):
         for chunk in perm_chunks:
             optimizer.zero_grad()
             model.train()
-            loss, actor_loss, critic_loss = loss_fn(model, rollout, trainer.block_mask, config, chunk)
+            loss, actor_loss, critic_loss, entropy_loss = loss_fn(model, rollout, trainer.block_mask, config, chunk)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
@@ -489,7 +498,17 @@ def train(trial_id: int, config: RLConfig):
         best_mean_reward = max(best_mean_reward, mean_reward)
         
         # Log metrics
-        console.print(f"[Step {epoch}] Loss: {loss.item():.4f} | Actor Loss: {actor_loss.item():.4f} | Critic Loss: {critic_loss.item():.4f} | Mean Reward: {mean_reward:.4f} | Best Mean Reward: {best_mean_reward:.4f} | Episodes: {trainer.completed_episodes}")
+        wandb.log({
+            "loss": loss.item(),
+            "actor_loss": actor_loss.item(),
+            "critic_loss": critic_loss.item(),
+            "entropy_loss": entropy_loss.item(),
+            "mean_reward": mean_reward,
+            "best_mean_reward": best_mean_reward,
+            "epoch": epoch
+        })
+        # Print metrics
+        console.print(f"[Step {epoch}] Loss: {loss.item():.4f} | Actor Loss: {actor_loss.item():.4f} | Critic Loss: {critic_loss.item():.4f} | Entropy Loss: {entropy_loss.item():.4f} | Mean Reward: {mean_reward:.4f} | Best Mean Reward: {best_mean_reward:.4f}")
     
     torch.save(model.state_dict(), f"checkpoints/trial_{trial_id}.pth")
     return objective
@@ -540,19 +559,19 @@ def enjoy(trial_id: int, config: RLConfig):
     model.to(memory_format=torch.channels_last)
 
     model_state_dict: dict = torch.load(f"checkpoints/trial_{trial_id}.pth")
-    model_state_dict["policy_head.in_linear.weight"] = model_state_dict["policy_head.p_linear.weight"]
-    model_state_dict["policy_head.out_linear.weight"] = model_state_dict["policy_head.linear.weight"]
-    model_state_dict["value_head.in_linear.weight"] = model_state_dict["value_head.p_linear.weight"]
-    model_state_dict["policy_head.in_linear.bias"] = model_state_dict["policy_head.p_linear.bias"]
-    model_state_dict["policy_head.out_linear.bias"] = model_state_dict["policy_head.linear.bias"]
-    model_state_dict["value_head.in_linear.bias"] = model_state_dict["value_head.p_linear.bias"]
+    # model_state_dict["policy_head.in_linear.weight"] = model_state_dict["policy_head.p_linear.weight"]
+    # model_state_dict["policy_head.out_linear.weight"] = model_state_dict["policy_head.linear.weight"]
+    # model_state_dict["value_head.in_linear.weight"] = model_state_dict["value_head.p_linear.weight"]
+    # model_state_dict["policy_head.in_linear.bias"] = model_state_dict["policy_head.p_linear.bias"]
+    # model_state_dict["policy_head.out_linear.bias"] = model_state_dict["policy_head.linear.bias"]
+    # model_state_dict["value_head.in_linear.bias"] = model_state_dict["value_head.p_linear.bias"]
 
-    del model_state_dict["policy_head.p_linear.weight"]
-    del model_state_dict["policy_head.linear.weight"]
-    del model_state_dict["value_head.p_linear.weight"]
-    del model_state_dict["policy_head.p_linear.bias"]
-    del model_state_dict["policy_head.linear.bias"]
-    del model_state_dict["value_head.p_linear.bias"]
+    # del model_state_dict["policy_head.p_linear.weight"]
+    # del model_state_dict["policy_head.linear.weight"]
+    # del model_state_dict["value_head.p_linear.weight"]
+    # del model_state_dict["policy_head.p_linear.bias"]
+    # del model_state_dict["policy_head.linear.bias"]
+    # del model_state_dict["value_head.p_linear.bias"]
 
     model.load_state_dict(model_state_dict)
     model.to(device)
@@ -573,7 +592,7 @@ def enjoy(trial_id: int, config: RLConfig):
 
 def rand_enjoy(trial_id: int, config: RLConfig):
     env = MultiToDiscreteWrapper(make(config["env_name"], render_mode="human", overrides=[
-        "game.num_agents=28",
+        "game.num_agents=24",
         "game.actions.change_color.enabled=false",
         "game.actions.swap.enabled=false",
         "game.actions.attack.enabled=false",
@@ -593,15 +612,14 @@ def objective(trial: optuna.Trial):
     config: RLConfig = {
         "env_name": "bases",
         "num_agents": 28,
-        "max_steps": 256,
-        "total_gradient_steps": 50_000 * 12,
+        "total_gradient_steps": 50_000,
         "minibatch_steps": 3,
-        "trajectory_length": 256,
+        "trajectory_length": 256 * 2,
         "learning_rate": 0.00012189571664289048,#trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
         "weight_decay": 2.8231209643433947e-06, #trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
         "grad_clip": 0.5, #trial.suggest_float("grad_clip", 0.05, 1.0, step=0.05),
         "vf_coef": 2.0, #trial.suggest_float("vf_coef", 0.1, 2.0),
-        "entropy_coef": 0.0000, #trial.suggest_float("entropy_coef", 0.0001, 0.1, log=True),
+        "entropy_coef": 0.0001, #trial.suggest_float("entropy_coef", 0.0001, 0.1, log=True),
         "vf_clip": 0.05, #trial.suggest_float("vf_clip", 0.05, 0.5),
         "gamma": 0.9778341518401994, #trial.suggest_float("gamma", 0.95, 0.999),
         "gae_lambda": 0.8709159722118665, #trial.suggest_float("gae_lambda", 0.8, 0.99),
@@ -611,12 +629,12 @@ def objective(trial: optuna.Trial):
         ),
         "device": "cuda",
         "d_model": 256,
-        "num_layers": 2,
+        "num_layers": 3,
         "num_heads": 8,
         "ffn_size": 512,
         "activation": "silu",
         "use_glu": False,
-        "cnn_channels": [32, 64],
+        "cnn_channels": [64, 256],
         "optimizer": "adam",
         "eps": 1e-12,
         "use_scheduler": True,
@@ -626,7 +644,9 @@ def objective(trial: optuna.Trial):
     }
 
     # torch.compiler.reset()
-    enjoy(3, config)
+    train(5, config)
+    # enjoy(4, config)
+    # rand_enjoy(4, config)
     # outcome = train(3, config)
     # return outcome
 

@@ -8,6 +8,27 @@ from sentiment_lm_torch.model.embeddings import Embedder
 from sentiment_lm_torch.model.feed_forward import FFBlock, GLUBlock
 
 
+class GatingMechanism(torch.nn.Module):
+    def __init__(self, d_input, bg=0.1):
+        super(GatingMechanism, self).__init__()
+        self.Wr = torch.nn.Linear(d_input, d_input)
+        self.Ur = torch.nn.Linear(d_input, d_input)
+        self.Wz = torch.nn.Linear(d_input, d_input)
+        self.Uz = torch.nn.Linear(d_input, d_input)
+        self.Wg = torch.nn.Linear(d_input, d_input)
+        self.Ug = torch.nn.Linear(d_input, d_input)
+        self.bg = bg
+
+        self.sigmoid = torch.nn.Sigmoid()
+        self.tanh = torch.nn.Tanh()
+
+    def forward(self, x, y):
+        r = self.sigmoid(self.Wr(y) + self.Ur(x))
+        z = self.sigmoid(self.Wz(y) + self.Uz(x) - self.bg)
+        h = self.tanh(self.Wg(y) + self.Ug(torch.mul(r, x)))
+        g = torch.mul(1 - z, x) + torch.mul(z, h)
+        return g
+
 class TransformerLayer(nn.Module):
     def __init__(
         self,
@@ -35,15 +56,18 @@ class TransformerLayer(nn.Module):
         ff_block = GLUBlock if glu else FFBlock
         self.ffn = ff_block(d_model, ffn_size, activation=activation)
 
+        self.attention_gate = GatingMechanism(d_model)
+        self.ffn_gate = GatingMechanism(d_model)
+
 
     def forward(self, x: Tensor, positions: Tensor, block_mask: BlockMask | None = None) -> Tensor:
         attention_input = self.attention_norm(x)
         attention = self.attention(attention_input, positions, block_mask=block_mask)
-        x = x + attention
+        x = self.attention_gate(x, attention)
 
         feed_forward_input = self.ffn_norm(x)
         feed_forward = self.ffn(feed_forward_input)
-        x = x + feed_forward
+        x = self.ffn_gate(x, feed_forward)
 
         return x
 
