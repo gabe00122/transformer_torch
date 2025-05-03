@@ -1,0 +1,10 @@
+_target_: sentiment_lm_torch.model.transformer.TransformerModel
+
+num_layers: 2
+num_heads: 8
+d_model: 128
+ffn_size: 128
+glu: false
+
+activation: 
+  _target_: torch.nn.ReLU

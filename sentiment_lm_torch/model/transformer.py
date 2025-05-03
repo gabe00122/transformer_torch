@@ -91,11 +91,7 @@ class TransformerModel(nn.Module):
     
     def init_kv_cache(self, batch_size: int, context_size: int, device: torch.device, dtype: torch.dtype):
         for layer in self.layers:
-            layer.attention.init_kv_cache(batch_size, context_size, device, dtype)
-
-    def clear_kv_cache(self):
-        for layer in self.layers:
-            layer.attention.clear_kv_cache()
+            layer.attention.ensure_kv_cache(batch_size, context_size, device, dtype)
 
     def forward(self, inputs: Tensor, positions: Tensor, block_mask: BlockMask | None = None) -> Tensor:
         x = self.embedder(inputs, decode=False)

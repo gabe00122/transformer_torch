@@ -1,5 +1,5 @@
 defaults:
-  - model: small
+  - model: micro
   - vocab: yelp
   - dataset: yelp
   - optimizer: adamw

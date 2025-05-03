@@ -545,7 +545,7 @@ def objective(trial: optuna.Trial):
         "trajectory_length": 256,
         "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
         "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
-        "grad_clip": trial.suggest_float("grad_clip", 0.05, 1.0, step=0.05),
+        "grad_clip": trial.suggest_float("grad_clip", 0.05, 1.0, step=0.05), # this was accidentally not used
         "vf_coef": trial.suggest_float("vf_coef", 0.1, 2.0),
         "entropy_coef": trial.suggest_float("entropy_coef", 0.0001, 0.1, log=True),
         "vf_clip": trial.suggest_float("vf_clip", 0.05, 0.5),
@@ -580,7 +580,7 @@ if __name__ == "__main__":
     storage_name = f"sqlite:///{study_name}.db"
     study = optuna.create_study(
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(n_startup_trials=20, multivariate=True, group=True),
+        sampler=optuna.samplers.GPSampler(),
         storage=storage_name,
     )
-    study.optimize(objective, n_trials=200)
+    study.optimize(objective, n_trials=500)
